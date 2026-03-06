@@ -28,15 +28,10 @@ def _load_apex_harrier():
     from .apex_harrier import ApexHarrierStrategy
     return ApexHarrierStrategy
 
-def _load_momentum():
-    from .momentum import MomentumStrategy
-    return MomentumStrategy
-
 
 _LOADERS: Dict[str, Callable] = {
     "astra_hawk":   _load_astra_hawk,
     "apex_harrier": _load_apex_harrier,
-    "momentum":     _load_momentum,
 }
 
 

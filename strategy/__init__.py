@@ -1,17 +1,12 @@
 # strategy/__init__.py
-from .base        import BaseStrategy, StrategyResult, PricePacket, SymbolConfig
-from .loader      import get_strategy, available_strategies
-from .persistence import PersistenceMixin, ShutdownManager, save_state, load_state
+from .base   import BaseStrategy, StrategyResult, PricePacket, PositionInfo
+from .loader import get_strategy, available_strategies
 
 __all__ = [
     "BaseStrategy",
     "StrategyResult",
     "PricePacket",
-    "SymbolConfig",
+    "PositionInfo",
     "get_strategy",
     "available_strategies",
-    "PersistenceMixin",
-    "ShutdownManager",
-    "save_state",
-    "load_state",
 ]

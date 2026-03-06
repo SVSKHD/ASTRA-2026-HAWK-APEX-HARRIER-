@@ -4,7 +4,9 @@ from __future__ import annotations
 """
 AstraHawk — threshold normal entry + late entry strategy.
 
-Decisions returned (no MT5 calls made here):
+PURE DECISION MAKER — no MT5, no files, no persistence.
+
+Decisions returned:
     WAIT
     ENTER_FIRST_LONG  / ENTER_FIRST_SHORT   — normal entry, price in 1x window
     ENTER_LATE_LONG   / ENTER_LATE_SHORT    — late entry, armed after jump-over
@@ -15,29 +17,32 @@ Decisions returned (no MT5 calls made here):
     SKIP_LATE_TOO_FAR                       — late armed but price ran past exit
     HALT_NOT_TRADEABLE                      — symbol disabled in config
 
-State persisted to:
-    data/strategy_state/astra_hawk/XAUUSD/state.json
+Internal state (_ThrState):
+    bias, crossed_1x, late_armed, window_hit counters, etc.
+    Persisted by executor via build_state()/apply_state().
+
+Position state (PositionInfo):
+    in_trade, side, entry_price, daily_done, trades_today
+    Owned by executor — strategy reads it, never writes it.
 """
-
-
-
 
 from typing import Any, Dict, Optional
 
-from .base        import BaseStrategy, StrategyResult, PricePacket, SymbolConfig
-from .persistence import PersistenceMixin
+from .base import BaseStrategy, StrategyResult, PricePacket, PositionInfo
 
 
 # ---------------------------------------------------------------------------
-# Internal state containers
+# Internal threshold tracking state (strategy-owned, in memory)
 # ---------------------------------------------------------------------------
 
 class _ThrState:
-    """Intraday threshold tracking state."""
+    """
+    Tracks bias direction, 1x crossing, late arm, window hits.
+    This is STRATEGY-INTERNAL state — not position/trade state.
+    """
     __slots__ = (
         "symbol", "start_price",
-        "bias", "in_trade", "side", "entry_mode",
-        "time_entered", "time_exited",
+        "bias",
         "crossed_1x", "crossed_1x_time", "crossed_1x_bias",
         "late_armed", "late_disabled_for_day",
         "window_hit_long", "window_hit_short",
@@ -45,188 +50,154 @@ class _ThrState:
     )
 
     def __init__(self, symbol: str, start_price: float):
-        self.symbol          = symbol
-        self.start_price     = start_price
-        self.bias            = "none"   # "long" | "short" | "none"
-        self.in_trade        = False
-        self.side            = "none"   # "buy" | "sell" | "none"
-        self.entry_mode      = None     # "normal" | "late"
-        self.time_entered    = None
-        self.time_exited     = None
-        self.crossed_1x      = False
-        self.crossed_1x_time = None
-        self.crossed_1x_bias = None
-        self.late_armed      = False
+        self.symbol              = symbol
+        self.start_price         = start_price
+        self.bias                = "none"       # "long" | "short" | "none"
+        self.crossed_1x          = False
+        self.crossed_1x_time     = None
+        self.crossed_1x_bias     = None
+        self.late_armed          = False
         self.late_disabled_for_day = False
-        self.window_hit_long  = 0
-        self.window_hit_short = 0
-        self.missed_jump_long = False
-        self.missed_jump_short= False
+        self.window_hit_long     = 0
+        self.window_hit_short    = 0
+        self.missed_jump_long    = False
+        self.missed_jump_short   = False
 
     def snapshot(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in self.__slots__}
 
     @classmethod
-    def from_snapshot(cls, d: Dict[str, Any]) -> "_ThrState":
-        o = cls(d["symbol"], float(d["start_price"]))
+    def from_snapshot(cls, d: Dict[str, Any]) -> _ThrState:
+        o = cls(d.get("symbol", ""), float(d.get("start_price", 0.0)))
         for k in cls.__slots__:
             if k in d:
                 setattr(o, k, d[k])
         return o
 
     def reset(self, new_start: float) -> None:
-        self.__init__(self.symbol, new_start)
-
-
-class _ExecState:
-    """Intraday execution tracking state."""
-    __slots__ = (
-        "symbol", "in_trade", "side",
-        "entry_price", "entry_time", "entry_mode",
-        "daily_done", "daily_entry_taken",
-        "realized_profit_usd", "trades_today",
-        "executed_zone_ids", "executed_keys",
-    )
-
-    def __init__(self, symbol: str):
-        self.symbol               = symbol
-        self.in_trade             = False
-        self.side                 = None
-        self.entry_price          = None
-        self.entry_time           = None
-        self.entry_mode           = None
-        self.daily_done           = False
-        self.daily_entry_taken    = False
-        self.realized_profit_usd  = 0.0
-        self.trades_today         = 0
-        self.executed_zone_ids    = set()
-        self.executed_keys        = set()
-
-    def snapshot(self) -> Dict[str, Any]:
-        return {
-            "symbol":              self.symbol,
-            "in_trade":            self.in_trade,
-            "side":                self.side,
-            "entry_price":         self.entry_price,
-            "entry_time":          self.entry_time,
-            "entry_mode":          self.entry_mode,
-            "daily_done":          self.daily_done,
-            "daily_entry_taken":   self.daily_entry_taken,
-            "realized_profit_usd": self.realized_profit_usd,
-            "trades_today":        self.trades_today,
-            "executed_zone_ids":   list(self.executed_zone_ids),
-            "executed_keys":       list(self.executed_keys),
-        }
-
-    @classmethod
-    def from_snapshot(cls, d: Dict[str, Any]) -> "_ExecState":
-        o = cls(d["symbol"])
-        o.in_trade            = bool(d.get("in_trade", False))
-        o.side                = d.get("side")
-        o.entry_price         = d.get("entry_price")
-        o.entry_time          = d.get("entry_time")
-        o.entry_mode          = d.get("entry_mode")
-        o.daily_done          = bool(d.get("daily_done", False))
-        o.daily_entry_taken   = bool(d.get("daily_entry_taken", False))
-        o.realized_profit_usd = float(d.get("realized_profit_usd", 0.0))
-        o.trades_today        = int(d.get("trades_today", 0))
-        o.executed_zone_ids   = set(int(x) for x in d.get("executed_zone_ids", []))
-        o.executed_keys       = set(str(x) for x in d.get("executed_keys", []))
-        return o
-
-    def reset(self) -> None:
         sym = self.symbol
-        self.__init__(sym)
+        self.__init__(sym, new_start)
+
+
+# ---------------------------------------------------------------------------
+# Level computation from SymbolConfig
+# ---------------------------------------------------------------------------
+
+def _levels(sc, start: float) -> Dict[str, float]:
+    t   = float(sc.threshold) * float(sc.pip_size)
+    em  = sc.entry_min_multiplier       # 1.0
+    ex  = sc.entry_max_multiplier       # 1.25
+    ca  = sc.close_multiplier           # 2.0
+
+    # late entry derived from multipliers
+    late_at_x     = ex                  # arm at entry_max → enter around 2x
+    late_exit_min = ca * 1.45           # ~2.9
+    late_exit_max = ca * 1.5            # 3.0
+    late_rem      = 10.0 * sc.pip_size
+    buf           = 2.0  * sc.pip_size
+
+    return {
+        # normal long
+        "long_first":           start + t * em,
+        "long_first_max":       start + t * ex,
+        "long_second":          start + t * ca,
+        "long_second_close":    start + t * ca - buf,
+        # late long
+        "long_late_entry":      start + t * late_at_x,
+        "long_late_entry_max":  start + t * late_exit_max - late_rem,
+        "long_late_exit_min":   start + t * late_exit_min,
+        # normal short
+        "short_first":          start - t * em,
+        "short_first_min":      start - t * ex,
+        "short_second":         start - t * ca,
+        "short_second_close":   start - t * ca + buf,
+        # late short
+        "short_late_entry":     start - t * late_at_x,
+        "short_late_entry_min": start - t * late_exit_max + late_rem,
+        "short_late_exit_min":  start - t * late_exit_min,
+    }
+
+
+def _x_values(start, current, high, low, pip_size, threshold):
+    """Compute x-multiples of threshold for current price and extremes."""
+    if pip_size <= 0 or threshold <= 0:
+        return None, None, None, None
+    x_up_now = max(0.0, (current - start) / pip_size) / threshold
+    x_dn_now = max(0.0, (start - current) / pip_size) / threshold
+    probe_up = max(current, high) if high is not None else current
+    probe_dn = min(current, low)  if low  is not None else current
+    x_up_ext = (probe_up - start) / pip_size / threshold
+    x_dn_ext = (start - probe_dn) / pip_size / threshold
+    return x_up_now, x_dn_now, x_up_ext, x_dn_ext
+
+
+def _zone_id(date_mt5: str, bias: str) -> Optional[int]:
+    if bias not in ("long", "short"):
+        return None
+    return int(date_mt5.replace("-", "")) * 10 + (1 if bias == "long" else 2)
 
 
 # ---------------------------------------------------------------------------
 # AstraHawkStrategy
 # ---------------------------------------------------------------------------
 
-class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
+class AstraHawkStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
         return "astra_hawk"
 
-    # lifecycle
+    # ── lifecycle ────────────────────────────────────────────────────────
 
-    def init(self, symbol: str, sc: SymbolConfig, base_dir: str) -> None:
-        super().init(symbol, sc, base_dir)
-        self._thr:  Optional[_ThrState]  = None
-        self._exec: Optional[_ExecState] = None
-        self._date: Optional[str]        = None
-        self._persist_init()   # register shutdown callback
-
-    def restore(self) -> None:
-        data = self._persist_load()
-        if data is None:
-            return
-        try:
-            self._apply_state(data)
-        except Exception as e:
-            print(f"[{self.name}:{self.symbol}] apply_state failed ({e!r}) -- fresh start")
-            self._thr  = None
-            self._exec = None
-            self._date = None
-
-    def persist(self) -> None:
-        if self._thr is None or self._exec is None:
-            return
-        self._persist_save(reason="tick")
+    def init(self, symbol: str, sc) -> None:
+        super().init(symbol, sc)
+        self._thr:  Optional[_ThrState] = None
+        self._date: Optional[str]       = None
 
     def on_new_day(self, new_start_price: float) -> None:
-        if self._thr is not None and self._exec is not None:
-            self._persist_save(reason="rollover")
         if self._thr:
             self._thr.reset(new_start_price)
-        if self._exec:
-            self._exec.reset()
         self._date = None
 
-    def _build_state(self) -> Dict[str, Any]:
+    def build_state(self) -> Dict[str, Any]:
         return {
-            "date_mt5":   self._date,
-            "in_trade":   self._exec.in_trade   if self._exec else False,
-            "daily_done": self._exec.daily_done  if self._exec else False,
-            "thr_state":  self._thr.snapshot()   if self._thr  else {},
-            "exec_state": self._exec.snapshot()  if self._exec else {},
+            "date_mt5": self._date,
+            "thr_state": self._thr.snapshot() if self._thr else {},
         }
 
-    def _apply_state(self, data: Dict[str, Any]) -> None:
-        self._date = data.get("date_mt5")
-        thr_d  = data.get("thr_state")
-        exec_d = data.get("exec_state")
-        if thr_d:
-            self._thr  = _ThrState.from_snapshot(thr_d)
-        if exec_d:
-            self._exec = _ExecState.from_snapshot(exec_d)
+    def apply_state(self, data: Dict[str, Any]) -> None:
+        try:
+            self._date = data.get("date_mt5")
+            thr_d = data.get("thr_state")
+            if thr_d and isinstance(thr_d, dict) and thr_d.get("start_price"):
+                self._thr = _ThrState.from_snapshot(thr_d)
+        except Exception as e:
+            print(f"[{self.name}:{getattr(self, 'symbol', '?')}] apply_state failed ({e!r}) — fresh start")
+            self._thr  = None
+            self._date = None
 
-    # ── main tick ────────────────────────────────────────────────────────────
+    # ── main tick ────────────────────────────────────────────────────────
 
-    def on_tick(self, pkt: PricePacket) -> StrategyResult:
+    def on_tick(self, pkt: PricePacket, pos: PositionInfo) -> StrategyResult:
         sc = self.sc
 
-        # initialise on first packet
+        # ── initialise on first packet ───────────────────────────────────
         if self._thr is None:
-            self._thr  = _ThrState(self.symbol, pkt.start_price)
-            self._exec = _ExecState(self.symbol)
+            self._thr = _ThrState(self.symbol, pkt.start_price)
 
-        # date change mid-run (safety net — runner calls on_new_day, but just in case)
+        # date change (safety net — executor calls on_new_day, but guard)
         if self._date is None:
             self._date = pkt.date_mt5
         elif pkt.date_mt5 != self._date:
             self._thr.reset(pkt.start_price)
-            self._exec.reset()
             self._date = pkt.date_mt5
 
-        thr  = self._thr
-        exec_= self._exec
+        thr = self._thr
 
-        # ── compute levels ───────────────────────────────────────────────────
+        # ── compute levels ───────────────────────────────────────────────
         lvl = _levels(sc, thr.start_price)
 
-        # ── x values ────────────────────────────────────────────────────────
+        # ── x values ────────────────────────────────────────────────────
         x_up_now, x_dn_now, x_up_ext, x_dn_ext = _x_values(
             thr.start_price, pkt.mid, pkt.high, pkt.low,
             sc.pip_size, sc.threshold,
@@ -248,15 +219,15 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
 
         zone_id = _zone_id(pkt.date_mt5, thr.bias)
 
-        # ── reclaim detection ────────────────────────────────────────────────
+        # ── reclaim detection ────────────────────────────────────────────
         reclaim = thr_price * 0.10
         if reclaim > 0 and abs(pkt.mid - thr.start_price) <= reclaim:
             if not thr.late_disabled_for_day:
                 thr.late_disabled_for_day = True
                 thr.late_armed            = False
 
-        # ── bias update (pre-1x, not frozen) ────────────────────────────────
-        bias_frozen = thr.late_armed or thr.in_trade
+        # ── bias update (pre-1x, not frozen) ────────────────────────────
+        bias_frozen = thr.late_armed or pos.in_trade
         if not thr.crossed_1x and not bias_frozen:
             move  = abs(pkt.mid - thr.start_price)
             min_m = thr_price * 0.25
@@ -272,10 +243,10 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
 
         zone_id = _zone_id(pkt.date_mt5, thr.bias)
 
-        # ── 1x crossing ──────────────────────────────────────────────────────
+        # ── 1x crossing ─────────────────────────────────────────────────
         crossed_1x_now = False
         if not thr.crossed_1x:
-            if thr.bias == "long"  and probe_up >= lvl["long_first"]:
+            if thr.bias == "long" and probe_up >= lvl["long_first"]:
                 thr.crossed_1x      = True
                 thr.crossed_1x_time = pkt.server_time
                 thr.crossed_1x_bias = "long"
@@ -292,14 +263,14 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
         if lvl["short_first_min"] <= pkt.mid <= lvl["short_first"]:
             thr.window_hit_short += 1
 
-        # ── build telemetry ──────────────────────────────────────────────────
+        # ── telemetry ────────────────────────────────────────────────────
         tel: Dict[str, Any] = {
             "bias":             thr.bias,
-            "in_trade":         exec_.in_trade,
-            "side":             exec_.side,
-            "entry_mode":       exec_.entry_mode,
-            "daily_done":       exec_.daily_done,
-            "trades_today":     exec_.trades_today,
+            "in_trade":         pos.in_trade,
+            "side":             pos.side,
+            "entry_mode":       pos.entry_mode,
+            "daily_done":       pos.daily_done,
+            "trades_today":     pos.trades_today,
             "crossed_1x":       thr.crossed_1x,
             "crossed_1x_now":   crossed_1x_now,
             "crossed_1x_time":  thr.crossed_1x_time,
@@ -319,7 +290,7 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
             "window_hit_short": thr.window_hit_short,
         }
 
-        # ── shortcut builder ─────────────────────────────────────────────────
+        # ── result builder ───────────────────────────────────────────────
         def _res(decision: str, action: str,
                  did_signal: bool = False, **kw) -> StrategyResult:
             return StrategyResult(
@@ -328,8 +299,8 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
                 decision   = decision,
                 action     = action,
                 did_signal = did_signal,
-                in_trade   = exec_.in_trade,
-                daily_done = exec_.daily_done,
+                in_trade   = pos.in_trade,
+                daily_done = pos.daily_done,
                 zone_id    = zone_id,
                 now_iso    = pkt.server_time,
                 telemetry  = {**tel, "miss_reason": kw.pop("miss_reason", "none"),
@@ -337,37 +308,36 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
                 **kw,
             )
 
-        # ── guards ───────────────────────────────────────────────────────────
-        if not sc.is_tradeable:
+        # ── guards ──────────────────────────────────────────────────────
+        if not sc.is_trading_enabled:
             return _res("HALT_NOT_TRADEABLE", "halt_not_tradeable",
                         miss_reason="not_tradeable")
 
-        if exec_.daily_done and not exec_.in_trade:
+        if pos.daily_done and not pos.in_trade:
             return _res("WAIT", "blocked_daily_done",
                         miss_reason="daily_done")
 
-        if exec_.trades_today >= sc.max_trades_per_day and not exec_.in_trade:
+        if pos.trades_today >= sc.max_trades_per_day and not pos.in_trade:
             return _res("WAIT", "blocked_max_trades",
                         miss_reason=f"max_trades={sc.max_trades_per_day}")
 
-        # ====================================================================
+        # ================================================================
         # NOT IN TRADE — entry logic
-        # ====================================================================
-        if not exec_.in_trade:
+        # ================================================================
+        if not pos.in_trade:
 
             # already past 2x?
-            if thr.bias == "long"  and probe_up >= lvl["long_second_close"]:
+            if thr.bias == "long" and probe_up >= lvl["long_second_close"]:
                 return _res("SKIP_DIRECT_TO_SECOND", "skip",
                             miss_reason="direct_to_second")
             if thr.bias == "short" and probe_dn <= lvl["short_second_close"]:
                 return _res("SKIP_DIRECT_TO_SECOND", "skip",
                             miss_reason="direct_to_second")
 
-            # ── LATE ENTRY ────────────────────────────────────────────────
-            late_entry_at_x  = sc.entry_max_multiplier       # default 1.25 → re-arm at 2x
-            late_exit_min_x  = sc.close_multiplier * 1.45    # ~2.9
-            late_exit_max_x  = sc.close_multiplier * 1.5     # 3.0
-            late_rem_price   = 10.0 * sc.pip_size
+            # ── LATE ENTRY ───────────────────────────────────────────────
+            late_entry_at_x = sc.entry_max_multiplier
+            late_exit_min_x = sc.close_multiplier * 1.45
+            late_exit_max_x = sc.close_multiplier * 1.5
 
             if (
                 sc.is_trading_enabled
@@ -375,7 +345,6 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
                 and not thr.late_disabled_for_day
                 and x_now is not None
             ):
-                # disarm if overshot exit zone
                 if x_now >= late_exit_max_x:
                     thr.late_armed = False
                 else:
@@ -384,9 +353,11 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
                             lo = lvl["long_late_entry"] - late_tol
                             hi = lvl["long_late_entry_max"]
                             if lo <= pkt.mid <= hi:
-                                return self._enter(
-                                    thr, exec_, pkt, "buy", "late",
-                                    zone_id, _res)
+                                thr.late_armed = False
+                                return _res(
+                                    "ENTER_LATE_LONG", "entered",
+                                    did_signal=True, side="buy",
+                                    entry_price=pkt.mid, entry_mode="late")
                             miss = "late_insufficient_room" if pkt.mid > hi else "late_price_not_reached"
                             return _res("WAIT", "waiting", miss_reason=miss)
                         elif x_now >= late_exit_max_x:
@@ -399,9 +370,11 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
                             lo = lvl["short_late_entry_min"]
                             hi = lvl["short_late_entry"] + late_tol
                             if lo <= pkt.mid <= hi:
-                                return self._enter(
-                                    thr, exec_, pkt, "sell", "late",
-                                    zone_id, _res)
+                                thr.late_armed = False
+                                return _res(
+                                    "ENTER_LATE_SHORT", "entered",
+                                    did_signal=True, side="sell",
+                                    entry_price=pkt.mid, entry_mode="late")
                             miss = "late_insufficient_room" if pkt.mid < lo else "late_price_not_reached"
                             return _res("WAIT", "waiting", miss_reason=miss)
                         elif x_now >= late_exit_max_x:
@@ -409,15 +382,17 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
                             return _res("SKIP_LATE_TOO_FAR", "skip",
                                         miss_reason="late_too_far")
 
-            # ── NORMAL ENTRY ──────────────────────────────────────────────
-            em = sc.entry_min_multiplier   # 1.0
-            ex = sc.entry_max_multiplier   # 1.25
-            ca = sc.close_multiplier       # 2.0
+            # ── NORMAL ENTRY ─────────────────────────────────────────────
+            em = sc.entry_min_multiplier
+            ex = sc.entry_max_multiplier
+            ca = sc.close_multiplier
 
             if thr.bias == "long" and x_up_ext is not None:
                 if em <= x_up_ext <= ex:
-                    return self._enter(thr, exec_, pkt, "buy", "normal",
-                                       zone_id, _res)
+                    return _res(
+                        "ENTER_FIRST_LONG", "entered",
+                        did_signal=True, side="buy",
+                        entry_price=pkt.mid, entry_mode="normal")
                 elif ex < x_up_ext < ca:
                     thr.late_armed = not thr.late_disabled_for_day
                     return _res("SKIP_JUMP_OVER_ENTRY", "skip",
@@ -433,8 +408,10 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
 
             elif thr.bias == "short" and x_dn_ext is not None:
                 if em <= x_dn_ext <= ex:
-                    return self._enter(thr, exec_, pkt, "sell", "normal",
-                                       zone_id, _res)
+                    return _res(
+                        "ENTER_FIRST_SHORT", "entered",
+                        did_signal=True, side="sell",
+                        entry_price=pkt.mid, entry_mode="normal")
                 elif ex < x_dn_ext < ca:
                     thr.late_armed = not thr.late_disabled_for_day
                     return _res("SKIP_JUMP_OVER_ENTRY", "skip",
@@ -450,135 +427,35 @@ class AstraHawkStrategy(PersistenceMixin, BaseStrategy):
 
             return _res("WAIT", "waiting", miss_reason="bias_not_set")
 
-        # ====================================================================
+        # ================================================================
         # IN TRADE — exit logic
-        # ====================================================================
-        if exec_.side == "buy":
-            if exec_.entry_mode == "late":
+        # ================================================================
+        if pos.side == "buy":
+            if pos.entry_mode == "late":
                 if probe_up >= lvl["long_late_exit_min"]:
-                    return self._exit(thr, exec_, pkt, "EXIT_LATE_LONG", zone_id, _res)
+                    return _res("EXIT_LATE_LONG", "exited",
+                                did_signal=True, side="buy",
+                                entry_price=pos.entry_price,
+                                exit_price=pkt.mid)
             else:
                 if probe_up >= lvl["long_second_close"]:
-                    return self._exit(thr, exec_, pkt, "EXIT_SECOND_LONG", zone_id, _res)
+                    return _res("EXIT_SECOND_LONG", "exited",
+                                did_signal=True, side="buy",
+                                entry_price=pos.entry_price,
+                                exit_price=pkt.mid)
 
-        elif exec_.side == "sell":
-            if exec_.entry_mode == "late":
+        elif pos.side == "sell":
+            if pos.entry_mode == "late":
                 if probe_dn <= lvl["short_late_exit_min"]:
-                    return self._exit(thr, exec_, pkt, "EXIT_LATE_SHORT", zone_id, _res)
+                    return _res("EXIT_LATE_SHORT", "exited",
+                                did_signal=True, side="sell",
+                                entry_price=pos.entry_price,
+                                exit_price=pkt.mid)
             else:
                 if probe_dn <= lvl["short_second_close"]:
-                    return self._exit(thr, exec_, pkt, "EXIT_SECOND_SHORT", zone_id, _res)
+                    return _res("EXIT_SECOND_SHORT", "exited",
+                                did_signal=True, side="sell",
+                                entry_price=pos.entry_price,
+                                exit_price=pkt.mid)
 
         return _res("WAIT", "holding", miss_reason="waiting_for_exit_level")
-
-    # ── entry / exit mutators ────────────────────────────────────────────────
-
-    def _enter(self, thr, exec_, pkt, side, mode, zone_id, _res):
-        thr.in_trade     = True
-        thr.side         = side
-        thr.time_entered = pkt.server_time
-        thr.entry_mode   = mode
-        thr.late_armed   = False
-
-        exec_.in_trade          = True
-        exec_.side              = side
-        exec_.entry_price       = pkt.mid
-        exec_.entry_time        = pkt.server_time
-        exec_.entry_mode        = mode
-        exec_.daily_entry_taken = True
-
-        # dedupe
-        if zone_id is not None:
-            exec_.executed_zone_ids.add(int(zone_id))
-        else:
-            key = f"{pkt.date_mt5}:{side}:{mode}:{pkt.mid:.2f}"
-            exec_.executed_keys.add(key)
-
-        decision = (
-            "ENTER_FIRST_LONG"  if side == "buy"  and mode == "normal" else
-            "ENTER_FIRST_SHORT" if side == "sell" and mode == "normal" else
-            "ENTER_LATE_LONG"   if side == "buy"  else
-            "ENTER_LATE_SHORT"
-        )
-        return _res(decision, "entered", did_signal=True,
-                    side=side, entry_price=pkt.mid, entry_mode=mode,
-                    miss_reason="none")
-
-    def _exit(self, thr, exec_, pkt, decision, zone_id, _res):
-        entry_price  = exec_.entry_price
-        side_before  = exec_.side
-
-        thr.in_trade     = False
-        thr.side         = "none"
-        thr.entry_mode   = None
-        thr.late_armed   = False
-        thr.time_exited  = pkt.server_time
-
-        exec_.in_trade   = False
-        exec_.side       = None
-        exec_.entry_price= None
-        exec_.entry_time = None
-        exec_.entry_mode = None
-        exec_.daily_done = True
-        exec_.trades_today += 1
-
-        return _res(decision, "exited", did_signal=True,
-                    side=side_before, entry_price=entry_price,
-                    exit_price=pkt.mid, miss_reason="none")
-
-
-# ---------------------------------------------------------------------------
-# Level computation from SymbolConfig
-# ---------------------------------------------------------------------------
-
-def _levels(sc: SymbolConfig, start: float) -> Dict[str, Any]:
-    t   = float(sc.threshold) * float(sc.pip_size)
-    em  = sc.entry_min_multiplier
-    ex  = sc.entry_max_multiplier
-    ca  = sc.close_multiplier
-
-    # late entry derived from multipliers
-    late_at_x    = ex             # arm at entry_max (e.g. 1.25) → enter at 2x
-    late_exit_min= ca * 1.45      # ~2.9
-    late_exit_max= ca * 1.5       # 3.0
-    late_rem     = 10.0 * sc.pip_size
-    buf          = 2.0  * sc.pip_size
-
-    return {
-        # normal
-        "long_first":          start + t * em,
-        "long_first_max":      start + t * ex,
-        "long_second":         start + t * ca,
-        "long_second_close":   start + t * ca - buf,
-        # late
-        "long_late_entry":     start + t * late_at_x,
-        "long_late_entry_max": start + t * late_exit_max - late_rem,
-        "long_late_exit_min":  start + t * late_exit_min,
-        # short normal
-        "short_first":         start - t * em,
-        "short_first_min":     start - t * ex,
-        "short_second":        start - t * ca,
-        "short_second_close":  start - t * ca + buf,
-        # short late
-        "short_late_entry":    start - t * late_at_x,
-        "short_late_entry_min":start - t * late_exit_max + late_rem,
-        "short_late_exit_min": start - t * late_exit_min,
-    }
-
-
-def _x_values(start, current, high, low, pip_size, threshold):
-    if pip_size <= 0 or threshold <= 0:
-        return None, None, None, None
-    x_up_now = max(0.0, (current - start) / pip_size) / threshold
-    x_dn_now = max(0.0, (start - current) / pip_size) / threshold
-    probe_up  = max(current, high) if high is not None else current
-    probe_dn  = min(current, low)  if low  is not None else current
-    x_up_ext  = (probe_up - start) / pip_size / threshold
-    x_dn_ext  = (start - probe_dn) / pip_size / threshold
-    return x_up_now, x_dn_now, x_up_ext, x_dn_ext
-
-
-def _zone_id(date_mt5: str, bias: str) -> Optional[int]:
-    if bias not in ("long", "short"):
-        return None
-    return int(date_mt5.replace("-", "")) * 10 + (1 if bias == "long" else 2)
