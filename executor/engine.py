@@ -4,9 +4,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 import os
+
 from config.symbols import SYMBOLS
 from strategy.base import StrategyResult
 from .price_reader import PricePacket
+from .trade import (
+    calc_profit,
+    close_all_positions_fok,
+    get_positions_snapshot,
+    get_realized_profit_since,
+    place_market_order_fok,
+)
 
 
 DAILY_PROFIT_LOCK_USD = float(os.environ.get("DAILY_PROFIT_LOCK_USD", 50.0))
@@ -72,42 +80,59 @@ class EngineState:
         self.order_in_flight = False
 
 
+def _safe_parse_iso(dt_text: Optional[str]) -> Optional[datetime]:
+    if not dt_text:
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _place_order(symbol: str, side: str, comment: str) -> Dict[str, Any]:
-    """
-    Replace with real trade.py order call when moving fully ACTIVE.
-    """
     sc = SYMBOLS.get(symbol)
-    return {
-        "retcode": TRADE_RETCODE_DONE,
-        "price": 0.0,
-        "volume": sc.lot_size if sc else 0.01,
-        "comment": comment,
-        "_stub": True,
-    }
+    return place_market_order_fok(
+        symbol=symbol,
+        side=side,
+        lot=sc.lot_size if sc else None,
+        comment=comment,
+    )
 
 
 def _close_positions(symbol: str, comment: str) -> Dict[str, Any]:
-    """
-    Replace with real trade.py close call when moving fully ACTIVE.
-    """
-    return {
-        "retcode": TRADE_RETCODE_DONE,
-        "closed": True,
-        "_stub": True,
-        "comment": comment,
-    }
+    return close_all_positions_fok(symbol=symbol, comment=comment)
 
 
 def _get_floating_pnl(symbol: str) -> float:
-    return 0.0
+    snap = get_positions_snapshot(symbol)
+    return float(snap.get("total_profit_usd") or 0.0)
 
 
-def _get_realized_pnl(symbol: str) -> float:
-    return 0.0
+def _get_realized_pnl(symbol: str, since_iso: Optional[str] = None) -> float:
+    since_dt = _safe_parse_iso(since_iso)
+    return float(get_realized_profit_since(symbol=symbol, since_dt=since_dt))
+
+
+def _reconcile_live_position_state(eng: EngineState) -> None:
+    snap = get_positions_snapshot(eng.symbol)
+    positions = snap.get("positions") or []
+    if not positions:
+        eng.reset_position()
+        return
+
+    pos = positions[0]
+    eng.in_trade = True
+    eng.side = pos.get("type")
+    eng.entry_price = float(pos.get("price_open") or 0.0)
+    eng.entry_mode = eng.entry_mode or "normal"
+    eng.entry_time = eng.entry_time or pos.get("time")
 
 
 def _risk_gate(eng: EngineState) -> Tuple[bool, str]:
-    realized = eng.realized_profit_usd
+    realized = float(eng.realized_profit_usd)
     floating = _get_floating_pnl(eng.symbol)
     total = realized + floating
 
@@ -141,6 +166,10 @@ def handle_signal(
     current = float(pkt.mid)
     sc = SYMBOLS.get(sig.symbol)
     now_iso = sig.now_iso or datetime.now(timezone.utc).isoformat()
+
+    if mode == "ACTIVE":
+        eng.realized_profit_usd = _get_realized_pnl(sig.symbol)
+        _reconcile_live_position_state(eng)
 
     def _r(action: str, did_trade: bool = False,
            block_reason: Optional[str] = None, **kw) -> ExecResult:
@@ -234,8 +263,10 @@ def handle_signal(
             eng.order_in_flight = False
 
         ret = order.get("retcode") if isinstance(order, dict) else None
-        if ret is None or int(ret) != TRADE_RETCODE_DONE:
-            return _r("order_rejected", block_reason=f"retcode={ret}")
+        success = bool(order.get("success", ret == TRADE_RETCODE_DONE)) if isinstance(order, dict) else False
+        if ret is None or int(ret) != TRADE_RETCODE_DONE or not success:
+            reason = order.get("error") if isinstance(order, dict) else None
+            return _r("order_rejected", block_reason=reason or f"retcode={ret}")
 
         confirmed = float(order.get("price") or current)
         eng.in_trade = True
@@ -292,13 +323,21 @@ def handle_signal(
                 exit_price=current,
             )
 
+        realized_before = float(eng.realized_profit_usd)
         try:
-            _close_positions(sig.symbol, "ASTRA_HAWK_EXIT")
+            close_result = _close_positions(sig.symbol, "ASTRA_HAWK_EXIT")
         except Exception as e:
             return _r("close_failed", block_reason=f"{type(e).__name__}:{e}")
 
-        realized = _get_realized_pnl(sig.symbol)
-        eng.realized_profit_usd = float(realized)
+        close_ret = close_result.get("retcode") if isinstance(close_result, dict) else None
+        close_ok = bool(close_result.get("closed", False)) if isinstance(close_result, dict) else False
+        if close_ret is None or int(close_ret) != TRADE_RETCODE_DONE or not close_ok:
+            reason = close_result.get("error") if isinstance(close_result, dict) else None
+            return _r("close_failed", block_reason=reason or f"retcode={close_ret}")
+
+        realized_after = _get_realized_pnl(sig.symbol)
+        trade_profit = float(realized_after - realized_before)
+        eng.realized_profit_usd = float(realized_after)
         eng.reset_position()
         eng.daily_done = True
 
@@ -306,8 +345,8 @@ def handle_signal(
             "trade_closed",
             did_trade=True,
             daily_done=True,
-            profit_usd=float(realized),
-            realized_profit_usd=float(realized),
+            profit_usd=trade_profit,
+            realized_profit_usd=float(realized_after),
             side=side_before,
             entry_price=entry_before,
             exit_price=current,
@@ -327,29 +366,41 @@ def _force_close(mode, eng: EngineState, symbol, now_iso, _r, comment):
         eng.daily_done = True
         return _r("sim_forced_closed", did_trade=True, daily_done=True)
 
+    realized_before = float(eng.realized_profit_usd)
     try:
-        _close_positions(symbol, comment)
+        close_result = _close_positions(symbol, comment)
     except Exception as e:
         return _r("risk_force_close_failed", block_reason=f"close_exception:{e}")
 
-    realized = _get_realized_pnl(symbol)
-    eng.realized_profit_usd = float(realized)
+    close_ret = close_result.get("retcode") if isinstance(close_result, dict) else None
+    close_ok = bool(close_result.get("closed", False)) if isinstance(close_result, dict) else False
+    if close_ret is None or int(close_ret) != TRADE_RETCODE_DONE or not close_ok:
+        reason = close_result.get("error") if isinstance(close_result, dict) else None
+        return _r("risk_force_close_failed", block_reason=reason or f"retcode={close_ret}")
+
+    realized_after = _get_realized_pnl(symbol)
+    eng.realized_profit_usd = float(realized_after)
     eng.reset_position()
     eng.daily_done = True
     return _r(
         "risk_forced_closed",
         did_trade=True,
         daily_done=True,
-        profit_usd=float(realized),
-        realized_profit_usd=float(realized),
+        profit_usd=float(realized_after - realized_before),
+        realized_profit_usd=float(realized_after),
     )
 
 
 def _sim_pnl(symbol: str, side, entry, current: float) -> float:
-    if entry is None:
+    if entry is None or side not in {"buy", "sell"}:
         return 0.0
     sc = SYMBOLS.get(symbol)
-    if sc is None or sc.pip_size <= 0:
+    if sc is None:
         return 0.0
-    pips = ((current - entry) if side == "buy" else (entry - current)) / sc.pip_size
-    return round(pips * sc.lot_size * 10.0, 2)
+    try:
+        return round(float(calc_profit(symbol, side, sc.lot_size, float(entry), float(current))), 2)
+    except Exception:
+        if sc.pip_size <= 0:
+            return 0.0
+        pips = ((current - entry) if side == "buy" else (entry - current)) / sc.pip_size
+        return round(pips * sc.lot_size * 10.0, 2)
