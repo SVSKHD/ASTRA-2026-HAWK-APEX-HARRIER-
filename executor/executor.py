@@ -24,8 +24,6 @@ import sys
 import time
 import json
 import signal
-import logging
-import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -33,11 +31,12 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 # Ensure project root in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.symbols import SYMBOLS, SymbolConfig
+from config.symbols import SYMBOLS, SymbolConfig, PnLLock
+from config.risk_lock import RISK_LOCK
 from config.selectors import get_trading_symbols, get_price_symbols, get_strategies_for_symbol
 
 from strategy.base import BaseStrategy, StrategyResult
-from strategy.loader import load_strategy
+from strategy.loader import get_strategy
 
 from .price_reader import PricePacket, read_price_packet
 from .trade import (
@@ -78,27 +77,15 @@ except ImportError:
 # Logging
 # ---------------------------------------------------------------------------
 
-logger = logging.getLogger("executor")
-logger.setLevel(logging.INFO)
+from core.logger import get_logger, log_trade_open, log_trade_close, log_trade_error
 
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-5s | %(message)s",
-        datefmt="%H:%M:%S"
-    ))
-    logger.addHandler(_h)
+logger = get_logger("executor")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 TRADE_RETCODE_DONE = 10009
-
-# Risk limits from environment
-DAILY_PROFIT_LOCK_USD = float(os.environ.get("DAILY_PROFIT_LOCK_USD", 50.0))
-DAILY_MAX_LOSS_USD = float(os.environ.get("DAILY_MAX_LOSS_USD", -30.0))
-CATASTROPHIC_LOSS_USD = float(os.environ.get("CATASTROPHIC_LOSS_USD", -75.0))
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +107,12 @@ class ExecutionState:
     entry_price: Optional[float] = None
     entry_time: Optional[str] = None
     ticket: Optional[int] = None
+
+    # Peak profit tracking (for min profit lock)
+    peak_profit_usd: float = 0.0
+    peak_profit_pips: float = 0.0
+    current_profit_usd: float = 0.0
+    current_profit_pips: float = 0.0
 
     # Daily tracking
     daily_done: bool = False
@@ -145,6 +138,21 @@ class ExecutionState:
         self.entry_price = None
         self.entry_time = None
         self.ticket = None
+        self.peak_profit_usd = 0.0
+        self.peak_profit_pips = 0.0
+        self.current_profit_usd = 0.0
+        self.current_profit_pips = 0.0
+
+    def update_profit(self, profit_usd: float, profit_pips: float = 0.0):
+        """Update current and peak profit."""
+        self.current_profit_usd = profit_usd
+        self.current_profit_pips = profit_pips
+
+        # Track peak
+        if profit_usd > self.peak_profit_usd:
+            self.peak_profit_usd = profit_usd
+        if profit_pips > self.peak_profit_pips:
+            self.peak_profit_pips = profit_pips
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +237,7 @@ class StrategyRegistry:
 
         # Load strategy class
         try:
-            strategy = load_strategy(strategy_name)
+            strategy = get_strategy(strategy_name)
             if strategy is None:
                 logger.error(f"Strategy '{strategy_name}' not found in loader")
                 return None
@@ -266,34 +274,84 @@ class StrategyRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Risk Gate
+# Risk Gate — Uses global RISK_LOCK
 # ---------------------------------------------------------------------------
 
-def check_risk_gate(state: ExecutionState, symbol: str) -> Tuple[bool, str]:
+def get_total_daily_pnl() -> Tuple[float, float]:
     """
-    Check if trading is allowed based on risk limits.
-    Returns (allowed, reason).
+    Get total realized and floating P&L across all symbols.
+
+    Returns:
+        (total_realized, total_floating)
     """
-    # Get current P&L
-    floating = 0.0
-    snap = get_positions_snapshot(symbol=symbol)
+    total_realized = 0.0
+    total_floating = 0.0
+
+    # Get floating from all positions
+    snap = get_positions_snapshot()  # All symbols
     if snap:
-        floating = snap.get("total_profit_usd", 0.0)
+        total_floating = snap.get("total_profit_usd", 0.0)
 
-    realized = state.realized_profit_usd
-    total = realized + floating
+    return total_realized, total_floating
 
-    # Check limits
-    if realized >= DAILY_PROFIT_LOCK_USD:
-        return False, f"profit_lock: realized={realized:.2f} >= {DAILY_PROFIT_LOCK_USD}"
 
-    if total <= DAILY_MAX_LOSS_USD:
-        return False, f"daily_max_loss: total={total:.2f} <= {DAILY_MAX_LOSS_USD}"
+def check_global_risk(total_realized: float) -> Tuple[bool, str]:
+    """
+    Check GLOBAL risk limits (account-wide).
+    Uses RISK_LOCK singleton.
 
-    if total <= CATASTROPHIC_LOSS_USD:
-        return False, f"catastrophic_loss: total={total:.2f} <= {CATASTROPHIC_LOSS_USD}"
+    Args:
+        total_realized: Total realized P&L for the day (all symbols)
+
+    Returns:
+        (allowed, reason)
+    """
+    # Get floating P&L
+    snap = get_positions_snapshot()
+    floating = snap.get("total_profit_usd", 0.0) if snap else 0.0
+
+    # Check global stop
+    should_stop, reason = RISK_LOCK.should_stop_all(total_realized, floating)
+    if should_stop:
+        return False, reason
 
     return True, "ok"
+
+
+def check_force_close_all(total_realized: float) -> Tuple[bool, str]:
+    """
+    Check if ALL positions should be force-closed (catastrophic loss).
+
+    Returns:
+        (should_close, reason)
+    """
+    snap = get_positions_snapshot()
+    floating = snap.get("total_profit_usd", 0.0) if snap else 0.0
+
+    return RISK_LOCK.should_force_close_all(total_realized, floating)
+
+
+def check_min_profit_lock(state: ExecutionState) -> Tuple[bool, str]:
+    """
+    Check if trade should close to lock in minimum profit.
+
+    Uses:
+        - state.peak_profit_usd (highest profit reached)
+        - state.current_profit_usd (current profit)
+        - RISK_LOCK.min_profit settings
+
+    Returns:
+        (should_close, reason)
+    """
+    if not state.in_trade:
+        return False, "not_in_trade"
+
+    return RISK_LOCK.check_trade_profit_lock(
+        peak_profit=state.peak_profit_usd,
+        current_profit=state.current_profit_usd,
+        peak_pips=state.peak_profit_pips,
+        current_pips=state.current_profit_pips,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +374,7 @@ def handle_signal(
         state: ExecutionState,
         sig: StrategyResult,
         pkt: PricePacket,
+        total_realized_pnl: float = 0.0,
 ) -> ExecResult:
     """
     Handle strategy signal — execute trade or simulate.
@@ -323,6 +382,13 @@ def handle_signal(
     Mode is determined by sc.is_trading_enabled:
         True  → ACTIVE (real trades via trade.py)
         False → MONITOR (simulate via calc_profit)
+
+    Args:
+        sc: Symbol configuration
+        state: Execution state for this symbol+strategy
+        sig: Strategy result from on_tick()
+        pkt: Current price packet
+        total_realized_pnl: Total realized P&L across all symbols (for global risk check)
     """
     mode = "ACTIVE" if sc.is_trading_enabled else "MONITOR"
     current_price = pkt.mid
@@ -369,8 +435,8 @@ def handle_signal(
         if state.order_in_flight:
             return _result("blocked_order_in_flight", block_reason="order_in_flight")
 
-        # Risk gate
-        allowed, reason = check_risk_gate(state, sig.symbol)
+        # Global risk gate
+        allowed, reason = check_global_risk(total_realized_pnl)
         if not allowed:
             return _result("blocked_risk", block_reason=reason)
 
@@ -417,8 +483,16 @@ def handle_signal(
                 f"ticket={state.ticket}"
             )
 
-            # Notify
-            _notify_trade_open(sig.symbol, side, confirmed_price, sig.strategy)
+            # Notify and log
+            _notify_trade_open(
+                symbol=sig.symbol,
+                side=side,
+                price=confirmed_price,
+                strategy=sig.strategy,
+                lot=sc.lot_size,
+                ticket=state.ticket,
+                mode="ACTIVE",
+            )
 
             return _result(
                 "trade_opened",
@@ -481,6 +555,7 @@ def handle_signal(
             if not profit:
                 profit = result.get("total_profit", 0.0)
 
+            closed_ticket = state.ticket or 0
             state.realized_profit_usd += profit
             state.daily_done = True
             state.reset_position()
@@ -490,8 +565,17 @@ def handle_signal(
                 f"profit=${profit:.2f}"
             )
 
-            # Notify
-            _notify_trade_close(sig.symbol, side_before, current_price, profit, sig.strategy)
+            # Notify and log
+            _notify_trade_close(
+                symbol=sig.symbol,
+                side=side_before,
+                entry_price=entry_before,
+                exit_price=current_price,
+                profit=profit,
+                strategy=sig.strategy,
+                ticket=closed_ticket,
+                mode="ACTIVE",
+            )
 
             return _result(
                 "trade_closed",
@@ -541,8 +625,13 @@ def handle_signal(
 # Notifications
 # ---------------------------------------------------------------------------
 
-def _notify_trade_open(symbol: str, side: str, price: float, strategy: str):
-    """Send notification for trade open."""
+def _notify_trade_open(symbol: str, side: str, price: float, strategy: str, lot: float = 0.0, ticket: int = 0,
+                       mode: str = "ACTIVE"):
+    """Send notification and log trade open."""
+    # Log to trade log
+    log_trade_open(symbol, side, price, lot, ticket, strategy, mode)
+
+    # Send notifications
     msg = f"📥 {symbol} {side.upper()} @ {price:.2f} | {strategy}"
 
     if HAS_DISCORD:
@@ -551,10 +640,15 @@ def _notify_trade_open(symbol: str, side: str, price: float, strategy: str):
         notify_telegram(msg)
 
 
-def _notify_trade_close(symbol: str, side: str, price: float, profit: float, strategy: str):
-    """Send notification for trade close."""
+def _notify_trade_close(symbol: str, side: str, entry_price: float, exit_price: float, profit: float, strategy: str,
+                        ticket: int = 0, mode: str = "ACTIVE"):
+    """Send notification and log trade close."""
+    # Log to trade log
+    log_trade_close(symbol, side, entry_price, exit_price, profit, ticket, strategy, mode)
+
+    # Send notifications
     emoji = "🟢" if profit >= 0 else "🔴"
-    msg = f"📤 {symbol} {side.upper()} closed @ {price:.2f} | {emoji} ${profit:.2f} | {strategy}"
+    msg = f"📤 {symbol} {side.upper()} closed @ {exit_price:.2f} | {emoji} ${profit:.2f} | {strategy}"
 
     if HAS_DISCORD:
         notify_discord("alerts", msg)
@@ -581,6 +675,23 @@ class Executor:
         # Track last processed date for day rollover
         self.last_date_mt5: Dict[str, str] = {}
 
+        # Global daily P&L tracking
+        self._daily_realized_pnl: float = 0.0
+        self._last_reset_date: Optional[str] = None
+
+    @property
+    def total_realized_pnl(self) -> float:
+        """Total realized P&L across all symbols for today."""
+        return self._daily_realized_pnl
+
+    def add_realized_pnl(self, amount: float):
+        """Add to daily realized P&L."""
+        self._daily_realized_pnl += amount
+
+    def reset_daily_pnl(self):
+        """Reset daily P&L (called on day rollover)."""
+        self._daily_realized_pnl = 0.0
+
     def get_state(self, symbol: str, strategy: str) -> ExecutionState:
         """Get or create execution state for symbol+strategy."""
         key = (symbol, strategy)
@@ -593,6 +704,12 @@ class Executor:
         if symbol in self.last_date_mt5:
             if self.last_date_mt5[symbol] != date_mt5:
                 logger.info(f"[{symbol}] Day rollover: {self.last_date_mt5[symbol]} → {date_mt5}")
+
+                # Reset global daily P&L (only once per day)
+                if self._last_reset_date != date_mt5:
+                    self.reset_daily_pnl()
+                    self._last_reset_date = date_mt5
+                    logger.info(f"🔄 Daily P&L reset for new day: {date_mt5}")
 
                 # Reset all states for this symbol
                 for (sym, strat), state in self.states.items():
@@ -638,11 +755,127 @@ class Executor:
 
         results = []
 
+        # ── Check for GLOBAL catastrophic loss (force close ALL) ─────────────
+        should_close_all, reason = check_force_close_all(self.total_realized_pnl)
+        if should_close_all:
+            logger.warning(f"⚠️ GLOBAL CATASTROPHIC LOSS: {reason}")
+            logger.warning(f"⚠️ Force closing ALL positions!")
+
+            # Force close all
+            close_result = close_all_positions_fok(
+                symbol=symbol,
+                comment="GLOBAL_CATASTROPHIC_FORCE_CLOSE",
+            )
+
+            profit = close_result.get("total_profit", 0.0)
+            self.add_realized_pnl(profit)
+
+            # Update all states for this symbol
+            for (sym, strat), state in self.states.items():
+                if sym == symbol and state.in_trade:
+                    state.realized_profit_usd += profit
+                    state.daily_done = True
+                    state.reset_position()
+
+                    log_trade_error(symbol, "GLOBAL_FORCE_CLOSE", reason, strat)
+
+                    results.append(ExecResult(
+                        symbol=symbol,
+                        strategy=strat,
+                        decision="FORCE_CLOSE",
+                        action="global_catastrophic_closed",
+                        mode="ACTIVE",
+                        did_trade=True,
+                        profit_usd=profit,
+                        block_reason=reason,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    ))
+
+            return results  # Stop processing
+
+        # ── Check MIN PROFIT LOCK for open trades ────────────────────────────
+        for (sym, strat), state in self.states.items():
+            if sym == symbol and state.in_trade and state.entry_price:
+                # Calculate current profit
+                current_profit = calc_profit(
+                    symbol=symbol,
+                    side=state.side,
+                    lot=sc.lot_size,
+                    open_price=state.entry_price,
+                    close_price=pkt.mid,
+                )
+
+                # Calculate pips
+                if state.side == "buy":
+                    current_pips = (pkt.mid - state.entry_price) / sc.pip_size
+                else:
+                    current_pips = (state.entry_price - pkt.mid) / sc.pip_size
+
+                # Update state
+                state.update_profit(current_profit, current_pips)
+
+                # Check min profit lock
+                should_close, reason = check_min_profit_lock(state)
+                if should_close:
+                    logger.info(f"💰 [{symbol}:{strat}] MIN PROFIT LOCK triggered: {reason}")
+                    logger.info(
+                        f"💰 Closing to lock profit: peak=${state.peak_profit_usd:.2f} → current=${current_profit:.2f}")
+
+                    # Close position
+                    if sc.is_trading_enabled and state.ticket:
+                        close_result = close_position_fok(
+                            ticket=state.ticket,
+                            comment="MIN_PROFIT_LOCK",
+                        )
+                        profit = close_result.get("profit", current_profit)
+                    else:
+                        profit = current_profit  # Simulated
+
+                    # Update state
+                    state.realized_profit_usd += profit
+                    self.add_realized_pnl(profit)
+                    state.daily_done = True
+
+                    entry_price = state.entry_price
+                    side = state.side
+                    ticket = state.ticket or 0
+                    state.reset_position()
+
+                    # Notify
+                    mode = "ACTIVE" if sc.is_trading_enabled else "MONITOR"
+                    _notify_trade_close(
+                        symbol=symbol,
+                        side=side,
+                        entry_price=entry_price,
+                        exit_price=pkt.mid,
+                        profit=profit,
+                        strategy=strat,
+                        ticket=ticket,
+                        mode=mode,
+                    )
+
+                    results.append(ExecResult(
+                        symbol=symbol,
+                        strategy=strat,
+                        decision="MIN_PROFIT_LOCK",
+                        action="min_profit_closed",
+                        mode=mode,
+                        did_trade=sc.is_trading_enabled,
+                        did_simulate=not sc.is_trading_enabled,
+                        side=side,
+                        entry_price=entry_price,
+                        exit_price=pkt.mid,
+                        profit_usd=profit,
+                        realized_profit_usd=state.realized_profit_usd,
+                        block_reason=reason,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    ))
+
         # Get active strategies from config
         strategy_names = sc.strategies
         if not strategy_names:
             logger.debug(f"[{symbol}] No active strategies")
-            return []
+            return results  # Return any force close results
 
         # Process each strategy
         for strategy_name in strategy_names:
@@ -667,9 +900,19 @@ class Executor:
                 # Persist strategy state
                 strategy.persist()
 
-                # Handle signal
-                result = handle_signal(sc, state, sig, pkt)
+                # Handle signal (pass global P&L for risk check)
+                result = handle_signal(
+                    sc=sc,
+                    state=state,
+                    sig=sig,
+                    pkt=pkt,
+                    total_realized_pnl=self.total_realized_pnl,
+                )
                 results.append(result)
+
+                # Track realized profit globally
+                if result.did_trade and result.profit_usd != 0:
+                    self.add_realized_pnl(result.profit_usd)
 
                 # Log if actionable
                 if result.action not in ("waiting", "none"):

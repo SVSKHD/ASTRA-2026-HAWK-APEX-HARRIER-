@@ -22,7 +22,6 @@ Internal:
 
 import time
 import functools
-import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
 from dataclasses import dataclass, field
@@ -35,16 +34,9 @@ from config.symbols import SYMBOLS, SymbolConfig
 # Logging
 # ---------------------------------------------------------------------------
 
-logger = logging.getLogger("trade")
-logger.setLevel(logging.INFO)
+from core.logger import get_logger
 
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    ))
-    logger.addHandler(_h)
+logger = get_logger("trade")
 
 
 # ---------------------------------------------------------------------------
