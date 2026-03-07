@@ -3,12 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
-
+import os
 from config.symbols import SYMBOLS
 from strategy.base import StrategyResult
 from .price_reader import PricePacket
 
-import os
 
 DAILY_PROFIT_LOCK_USD = float(os.environ.get("DAILY_PROFIT_LOCK_USD", 50.0))
 DAILY_MAX_LOSS_USD = float(os.environ.get("DAILY_MAX_LOSS_USD", -30.0))
@@ -91,7 +90,12 @@ def _close_positions(symbol: str, comment: str) -> Dict[str, Any]:
     """
     Replace with real trade.py close call when moving fully ACTIVE.
     """
-    return {"retcode": TRADE_RETCODE_DONE, "closed": True, "_stub": True, "comment": comment}
+    return {
+        "retcode": TRADE_RETCODE_DONE,
+        "closed": True,
+        "_stub": True,
+        "comment": comment,
+    }
 
 
 def _get_floating_pnl(symbol: str) -> float:
@@ -109,10 +113,10 @@ def _risk_gate(eng: EngineState) -> Tuple[bool, str]:
 
     if realized >= DAILY_PROFIT_LOCK_USD:
         return False, f"profit_lock realized={realized:.2f}>={DAILY_PROFIT_LOCK_USD}"
-    if total <= DAILY_MAX_LOSS_USD:
-        return False, f"daily_max_loss total={total:.2f}<={DAILY_MAX_LOSS_USD}"
     if total <= CATASTROPHIC_LOSS_USD:
         return False, f"catastrophic_loss total={total:.2f}<={CATASTROPHIC_LOSS_USD}"
+    if total <= DAILY_MAX_LOSS_USD:
+        return False, f"daily_max_loss total={total:.2f}<={DAILY_MAX_LOSS_USD}"
 
     return True, "ok"
 
@@ -155,6 +159,9 @@ def handle_signal(
             telemetry=sig.telemetry or {},
             **kw,
         )
+
+    if sc is None:
+        return _r("blocked_unknown_symbol", block_reason=f"unknown_symbol={sig.symbol}")
 
     if sig.decision in ("WAIT", "HALT_NOT_TRADEABLE") or \
        sig.decision.startswith("SKIP_") or \
@@ -254,12 +261,16 @@ def handle_signal(
         entry_before = eng.entry_price
 
         if mode == "MONITOR_ONLY":
+            pnl = _sim_pnl(sig.symbol, side_before, entry_before, current)
+            eng.realized_profit_usd += pnl
             eng.reset_position()
             eng.daily_done = True
             return _r(
                 "monitor_only_exit",
                 did_trade=False,
                 daily_done=True,
+                profit_usd=pnl,
+                realized_profit_usd=eng.realized_profit_usd,
                 side=side_before,
                 entry_price=entry_before,
                 exit_price=current,
