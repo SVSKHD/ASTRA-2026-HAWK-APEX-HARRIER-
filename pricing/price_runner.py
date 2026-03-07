@@ -11,7 +11,7 @@ import MetaTrader5 as mt5
 from settings import PriceSettings
 from price_assembly import build_price_packet
 from storage import resolve_price_assembly_root_path, atomic_write_json, append_jsonl
-from config import get_price_symbols
+from config import get_enabled_symbols
 
 def ensure_mt5():
     if mt5.initialize():
@@ -243,7 +243,7 @@ def run_price_runner(cfg: PriceSettings, enabled_symbols: list[str]):
 
 if __name__ == "__main__":
     cfg = PriceSettings()
-    enabled_symbols = get_price_symbols()
+    enabled_symbols = get_enabled_symbols()
 
     print("=== PRICE RUNNER STARTING ===")
     print(f"enabled_symbols={enabled_symbols}")

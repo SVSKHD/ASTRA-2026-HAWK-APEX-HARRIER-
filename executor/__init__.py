@@ -1,7 +1,8 @@
 # executor/__init__.py
-from .executor import Executor, ExecResult, ExecutionState, handle_signal
+from .engine import EngineState, ExecResult, handle_signal
 from .price_reader import PricePacket, read_price_packet
 from .trade import (
+    TradeResult,
     place_market_order_fok,
     close_all_positions_fok,
     close_position_fok,
@@ -12,17 +13,12 @@ from .trade import (
 )
 
 __all__ = [
-    # Executor
-    "Executor",
+    "EngineState",
     "ExecResult",
-    "ExecutionState",
     "handle_signal",
-
-    # Price Reader
     "PricePacket",
     "read_price_packet",
-
-    # Trade
+    "TradeResult",
     "place_market_order_fok",
     "close_all_positions_fok",
     "close_position_fok",

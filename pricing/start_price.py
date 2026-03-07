@@ -19,7 +19,7 @@ from storage import (
     append_line,
 )
 import threading
-from config import get_price_symbols
+from config import get_enabled_symbols
 
 MIDNIGHT_GRACE_MINUTES = 10
 STALE_AFTER_SECONDS = 20  # tune: 10–60
@@ -295,7 +295,7 @@ if __name__ == "__main__":
 
 
     cfg = PriceSettings()
-    symbols = get_price_symbols()
+    symbols = get_enabled_symbols()
 
     print("=== START PRICE RUNNER STARTING ===", symbols)
     for s in symbols:
