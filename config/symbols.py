@@ -193,3 +193,5 @@ SYMBOLS: dict[str, SymbolConfig] = {
         strategy_independent_trades  = False,
     ),
 }
+
+

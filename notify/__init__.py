@@ -1,8 +1,45 @@
 # notify/__init__.py
-from .discord import DiscordConfig, send_plain as discord_plain, send_price_update as discord_price
-from .telegram import TelegramConfig, send_plain as telegram_plain, send_price_update as telegram_price
+from .discord import (
+    DiscordConfig,
+    DiscordClient,
+    init as init_discord,
+    notify_discord,
+    get_client as get_discord_client,
+    # Channel constants
+    CHANNEL_GENERAL,
+    CHANNEL_CRITICAL,
+    CHANNEL_ALERTS,
+    CHANNEL_UPDATES,
+    CHANNEL_ERRORS,
+)
+
+from .telegram import (
+    TelegramConfig,
+    TelegramClient,
+    init as init_telegram,
+    notify_telegram,
+    get_client as get_telegram_client,
+)
 
 __all__ = [
-    "DiscordConfig", "discord_plain", "discord_price",
-    "TelegramConfig", "telegram_plain", "telegram_price",
+    # Discord
+    "DiscordConfig",
+    "DiscordClient",
+    "init_discord",
+    "notify_discord",
+    "get_discord_client",
+
+    # Telegram
+    "TelegramConfig",
+    "TelegramClient",
+    "init_telegram",
+    "notify_telegram",
+    "get_telegram_client",
+
+    # Channel constants (shared)
+    "CHANNEL_GENERAL",
+    "CHANNEL_CRITICAL",
+    "CHANNEL_ALERTS",
+    "CHANNEL_UPDATES",
+    "CHANNEL_ERRORS",
 ]

@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-
 # ---------------------------------------------------------------------------
 # Telegram rate limits:
 #   - 30 messages / second globally per bot
@@ -26,19 +25,19 @@ from typing import Any, Dict, List, Optional, Tuple
 #   - On other errors: exponential backoff up to MAX_RETRIES
 # ---------------------------------------------------------------------------
 
-CHANNEL_GENERAL  = "general"
+CHANNEL_GENERAL = "general"
 CHANNEL_CRITICAL = "critical"
-CHANNEL_ALERTS   = "alerts"
-CHANNEL_UPDATES  = "updates"
-CHANNEL_ERRORS   = "errors"
+CHANNEL_ALERTS = "alerts"
+CHANNEL_UPDATES = "updates"
+CHANNEL_ERRORS = "errors"
 
 ALL_CHANNELS = (CHANNEL_GENERAL, CHANNEL_CRITICAL, CHANNEL_ALERTS, CHANNEL_UPDATES, CHANNEL_ERRORS)
 
-_BUCKET_CAPACITY  = 18      # safe under Telegram's 20/min per chat
-_REFILL_RATE      = 3.0     # seconds per token
-_MAX_RETRIES      = 5
+_BUCKET_CAPACITY = 18  # safe under Telegram's 20/min per chat
+_REFILL_RATE = 3.0  # seconds per token
+_MAX_RETRIES = 5
 _RETRY_BASE_SLEEP = 1.0
-_SEND_TIMEOUT     = 6.0
+_SEND_TIMEOUT = 6.0
 
 # Telegram HTML entities that must be escaped in user-supplied strings
 _HTML_ESCAPE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
@@ -84,22 +83,23 @@ class TelegramConfig:
         updates   — periodic: price snapshots, start-price lock, H/L
         errors    — exceptions, stale ticks, write failures
     """
+
     def __init__(
-        self,
-        bot_token: str,
-        general:   str = "",
-        critical:  str = "",
-        alerts:    str = "",
-        updates:   str = "",
-        errors:    str = "",
+            self,
+            bot_token: str,
+            general: str = "",
+            critical: str = "",
+            alerts: str = "",
+            updates: str = "",
+            errors: str = "",
     ):
         self.bot_token = bot_token
         self.chat_ids: Dict[str, str] = {
-            CHANNEL_GENERAL:  general,
+            CHANNEL_GENERAL: general,
             CHANNEL_CRITICAL: critical,
-            CHANNEL_ALERTS:   alerts,
-            CHANNEL_UPDATES:  updates,
-            CHANNEL_ERRORS:   errors,
+            CHANNEL_ALERTS: alerts,
+            CHANNEL_UPDATES: updates,
+            CHANNEL_ERRORS: errors,
         }
 
     @property
@@ -116,18 +116,18 @@ class TelegramConfig:
 
 class _TokenBucket:
     def __init__(self, capacity: int, refill_rate_seconds: float):
-        self._capacity    = capacity
-        self._tokens      = float(capacity)
-        self._rate        = refill_rate_seconds
+        self._capacity = capacity
+        self._tokens = float(capacity)
+        self._rate = refill_rate_seconds
         self._last_refill = time.monotonic()
 
     def consume(self) -> None:
         while True:
-            now     = time.monotonic()
+            now = time.monotonic()
             elapsed = now - self._last_refill
-            gained  = elapsed / self._rate
+            gained = elapsed / self._rate
             if gained > 0:
-                self._tokens      = min(self._capacity, self._tokens + gained)
+                self._tokens = min(self._capacity, self._tokens + gained)
                 self._last_refill = now
             if self._tokens >= 1.0:
                 self._tokens -= 1.0
@@ -142,10 +142,10 @@ class _TokenBucket:
 @dataclass
 class _QueueItem:
     base_url: str
-    chat_id:  str
-    text:     str
-    silent:   bool
-    channel:  str
+    chat_id: str
+    text: str
+    silent: bool
+    channel: str
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ class _ChannelSender(threading.Thread):
     def __init__(self, channel: str):
         super().__init__(name=f"telegram-{channel}", daemon=True)
         self.channel = channel
-        self._q      = queue.Queue()   # type: queue.Queue[_QueueItem]
+        self._q = queue.Queue()  # type: queue.Queue[_QueueItem]
         self._bucket = _TokenBucket(_BUCKET_CAPACITY, _REFILL_RATE)
         self.dropped = 0
 
@@ -203,17 +203,17 @@ class _ChannelSender(threading.Thread):
 # ---------------------------------------------------------------------------
 
 def _post_message(item: _QueueItem) -> Tuple[bool, Optional[float]]:
-    url     = f"{item.base_url}/sendMessage"
+    url = f"{item.base_url}/sendMessage"
     payload = {
-        "chat_id":                  item.chat_id,
-        "text":                     item.text,
-        "parse_mode":               "HTML",
+        "chat_id": item.chat_id,
+        "text": item.text,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
-        "disable_notification":     item.silent,
+        "disable_notification": item.silent,
     }
     try:
         data = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(
+        req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -226,8 +226,8 @@ def _post_message(item: _QueueItem) -> Tuple[bool, Optional[float]]:
         if e.code == 429:
             retry_after: Optional[float] = 3.0
             try:
-                body        = json.loads(e.read().decode("utf-8"))
-                params      = body.get("parameters") or {}
+                body = json.loads(e.read().decode("utf-8"))
+                params = body.get("parameters") or {}
                 retry_after = float(params.get("retry_after", 3.0))
             except Exception:
                 pass
@@ -292,7 +292,7 @@ class TelegramClient:
     """
 
     def __init__(self, cfg: TelegramConfig):
-        self._cfg     = cfg
+        self._cfg = cfg
         self._senders = {ch: _ChannelSender(ch) for ch in ALL_CHANNELS}
         self._started = False
 
@@ -332,6 +332,14 @@ class TelegramClient:
         return True
 
     # ------------------------------------------------------------------ #
+    # Plain text
+    # ------------------------------------------------------------------ #
+
+    def send_plain(self, channel: str, message: str, silent: bool = False) -> bool:
+        """Send a plain text message to a channel."""
+        return self._enqueue(channel, message, silent=silent)
+
+    # ------------------------------------------------------------------ #
     # general channel                                                      #
     # ------------------------------------------------------------------ #
 
@@ -340,8 +348,8 @@ class TelegramClient:
         text = (
             f"🚀 <b>System Started</b>\n"
             f"{_div()}\n"
-            f"{_row('Symbols',  '  '.join(symbols))}\n"
-            f"{_row('Status',   'ONLINE')}\n"
+            f"{_row('Symbols', '  '.join(symbols))}\n"
+            f"{_row('Status', 'ONLINE')}\n"
             f"{_footer('astra-hawk-2026 | general')}"
         )
         return self._enqueue(CHANNEL_GENERAL, text)
@@ -359,9 +367,9 @@ class TelegramClient:
         text = (
             f"🔁 <b>Day Rollover</b>  |  <code>{_esc(symbol)}</code>\n"
             f"{_div()}\n"
-            f"{_row('Symbol',   symbol)}\n"
-            f"{_row('From',     old_date)}\n"
-            f"{_row('To',       new_date)}\n"
+            f"{_row('Symbol', symbol)}\n"
+            f"{_row('From', old_date)}\n"
+            f"{_row('To', new_date)}\n"
             f"{_row('Tick UTC', tick_utc)}\n"
             f"{_footer('astra-hawk-2026 | general')}"
         )
@@ -384,9 +392,38 @@ class TelegramClient:
         text = (
             f"🚨 <b>MT5 Disconnected</b>  |  <code>{_esc(symbol)}</code>\n"
             f"{_div()}\n"
-            f"{_row('Symbol',    symbol)}\n"
+            f"{_row('Symbol', symbol)}\n"
             f"{_row('Stale For', f'{stale_seconds}s')}\n"
-            f"{_row('Action',    'CHECK MT5 TERMINAL')}\n"
+            f"{_row('Action', 'CHECK MT5 TERMINAL')}\n"
+            f"{_footer('astra-hawk-2026 | critical')}"
+        )
+        return self._enqueue(CHANNEL_CRITICAL, text, silent=False)
+
+    def send_catastrophic_loss(
+            self,
+            total_loss: float,
+            limit: float,
+            symbols_closed: List[str] = None,
+    ) -> bool:
+        """Send catastrophic loss alert."""
+        symbols_str = ", ".join(symbols_closed) if symbols_closed else "None"
+        text = (
+            f"🚨 <b>CATASTROPHIC LOSS — Trading Halted</b>\n"
+            f"{_div()}\n"
+            f"{_row('Total Loss', f'${total_loss:.2f}')}\n"
+            f"{_row('Limit', f'${limit:.2f}')}\n"
+            f"{_row('Closed', symbols_str)}\n"
+            f"{_footer('astra-hawk-2026 | critical')}"
+        )
+        return self._enqueue(CHANNEL_CRITICAL, text, silent=False)
+
+    def send_profit_lock(self, total_profit: float, limit: float) -> bool:
+        """Send profit lock notification."""
+        text = (
+            f"🔒 <b>PROFIT LOCKED — Trading Stopped</b>\n"
+            f"{_div()}\n"
+            f"{_row('Profit', f'+${total_profit:.2f}')}\n"
+            f"{_row('Target', f'${limit:.2f}')}\n"
             f"{_footer('astra-hawk-2026 | critical')}"
         )
         return self._enqueue(CHANNEL_CRITICAL, text, silent=False)
@@ -396,18 +433,20 @@ class TelegramClient:
     # ------------------------------------------------------------------ #
 
     def send_trade_alert(
-        self,
-        symbol:    str,
-        action:    str,           # ENTRY | EXIT | HEDGE | SL_HIT | TP_HIT
-        direction: str,           # BUY | SELL
-        price:     float,
-        lots:      float,
-        reason:    str = "",
-        profit:    Optional[float] = None,
+            self,
+            symbol: str,
+            action: str,  # ENTRY | EXIT | HEDGE | SL_HIT | TP_HIT | MIN_PROFIT_LOCK
+            direction: str,  # BUY | SELL
+            price: float,
+            lots: float,
+            reason: str = "",
+            profit: Optional[float] = None,
+            ticket: Optional[int] = None,
     ) -> bool:
         icon = {
-            "ENTRY":  "📥", "EXIT":   "📤",
-            "HEDGE":  "🔀", "SL_HIT": "🛑", "TP_HIT": "🎯",
+            "ENTRY": "📥", "EXIT": "📤",
+            "HEDGE": "🔀", "SL_HIT": "🛑", "TP_HIT": "🎯",
+            "MIN_PROFIT_LOCK": "💰",
         }.get(action, "📌")
 
         profit_line = ""
@@ -416,17 +455,43 @@ class TelegramClient:
             profit_line = f"\n{_row('Profit', f'{sign}{profit:.2f}')}"
 
         reason_line = f"\n{_row('Reason', reason)}" if reason else ""
+        ticket_line = f"\n{_row('Ticket', ticket)}" if ticket else ""
 
         text = (
             f"{icon} <b>{action}</b>  |  <code>{_esc(symbol)}</code>  |  <b>{_esc(direction)}</b>\n"
             f"{_div()}\n"
-            f"{_row('Symbol',    symbol)}\n"
-            f"{_row('Action',    action)}\n"
+            f"{_row('Symbol', symbol)}\n"
+            f"{_row('Action', action)}\n"
             f"{_row('Direction', direction)}\n"
-            f"{_row('Price',     f'{price:.5f}')}\n"
-            f"{_row('Lots',      lots)}"
+            f"{_row('Price', f'{price:.5f}')}\n"
+            f"{_row('Lots', lots)}"
+            f"{ticket_line}"
             f"{profit_line}"
             f"{reason_line}\n"
+            f"{_footer('astra-hawk-2026 | alerts')}"
+        )
+        return self._enqueue(CHANNEL_ALERTS, text, silent=False)
+
+    def send_min_profit_lock(
+            self,
+            symbol: str,
+            direction: str,
+            entry_price: float,
+            exit_price: float,
+            peak_profit: float,
+            locked_profit: float,
+            strategy: str = "",
+    ) -> bool:
+        """Send min profit lock alert."""
+        text = (
+            f"💰 <b>MIN PROFIT LOCK</b>  |  <code>{_esc(symbol)}</code>\n"
+            f"{_div()}\n"
+            f"{_row('Direction', direction)}\n"
+            f"{_row('Entry', f'{entry_price:.5f}')}\n"
+            f"{_row('Exit', f'{exit_price:.5f}')}\n"
+            f"{_row('Peak Profit', f'+${peak_profit:.2f}')}\n"
+            f"{_row('Locked', f'+${locked_profit:.2f}')}\n"
+            f"{_row('Strategy', strategy)}\n"
             f"{_footer('astra-hawk-2026 | alerts')}"
         )
         return self._enqueue(CHANNEL_ALERTS, text, silent=False)
@@ -436,65 +501,88 @@ class TelegramClient:
     # ------------------------------------------------------------------ #
 
     def send_start_locked(
-        self,
-        symbol:             str,
-        price:              float,
-        date_mt5:           str,
-        source:             str,
-        locked_server_time: str,
-        locked_local_time:  str,
+            self,
+            symbol: str,
+            price: float,
+            date_mt5: str,
+            source: str,
+            locked_server_time: str,
+            locked_local_time: str,
     ) -> bool:
         text = (
             f"🔒 <b>Start Price Locked</b>  |  <code>{_esc(symbol)}</code>\n"
             f"{_div()}\n"
-            f"{_row('Symbol',      symbol)}\n"
-            f"{_row('Date MT5',    date_mt5)}\n"
+            f"{_row('Symbol', symbol)}\n"
+            f"{_row('Date MT5', date_mt5)}\n"
             f"{_row('Start Price', f'{price:.5f}')}\n"
-            f"{_row('Source',      source)}\n"
-            f"{_row('Server',      locked_server_time)}\n"
-            f"{_row('Local',       locked_local_time)}\n"
+            f"{_row('Source', source)}\n"
+            f"{_row('Server', locked_server_time)}\n"
+            f"{_row('Local', locked_local_time)}\n"
             f"{_footer('astra-hawk-2026 | updates')}"
         )
         return self._enqueue(CHANNEL_UPDATES, text, silent=True)
 
     def send_price_update(
-        self,
-        symbol:      str,
-        mid:         float,
-        bid:         float,
-        ask:         float,
-        start_price: Optional[float],
-        high:        Optional[float],
-        low:         Optional[float],
-        stale:       bool,
-        date_mt5:    str,
-        server_time: str,
+            self,
+            symbol: str,
+            mid: float,
+            bid: float,
+            ask: float,
+            start_price: Optional[float],
+            high: Optional[float],
+            low: Optional[float],
+            stale: bool,
+            date_mt5: str,
+            server_time: str,
     ) -> bool:
         status = "⏸ STALE" if stale else "✅ LIVE"
 
         delta_line = ""
         if start_price and start_price > 0:
-            d    = mid - start_price
+            d = mid - start_price
             sign = "+" if d >= 0 else ""
             delta_line = f"\n{_row('Δ Start', f'{sign}{d:.5f}')}"
 
         high_line = f"\n{_row('Day High', f'{high:.5f}')}" if high is not None else ""
-        low_line  = f"\n{_row('Day Low',  f'{low:.5f}')}"  if low  is not None else ""
-        sp_line   = f"\n{_row('Start',    f'{start_price:.5f}')}" if start_price is not None else ""
+        low_line = f"\n{_row('Day Low', f'{low:.5f}')}" if low is not None else ""
+        sp_line = f"\n{_row('Start', f'{start_price:.5f}')}" if start_price is not None else ""
 
         text = (
             f"📊 <b>{_esc(symbol)}</b>  |  {status}\n"
             f"{_div()}\n"
-            f"{_row('MID',     f'{mid:.5f}')}\n"
-            f"{_row('BID',     f'{bid:.5f}')}\n"
-            f"{_row('ASK',     f'{ask:.5f}')}"
+            f"{_row('MID', f'{mid:.5f}')}\n"
+            f"{_row('BID', f'{bid:.5f}')}\n"
+            f"{_row('ASK', f'{ask:.5f}')}"
             f"{sp_line}"
             f"{delta_line}"
             f"{high_line}"
             f"{low_line}\n"
             f"{_div()}\n"
             f"{_row('Date MT5', date_mt5)}\n"
-            f"{_row('Server',   server_time)}\n"
+            f"{_row('Server', server_time)}\n"
+            f"{_footer('astra-hawk-2026 | updates')}"
+        )
+        return self._enqueue(CHANNEL_UPDATES, text, silent=True)
+
+    def send_daily_summary(
+            self,
+            date_mt5: str,
+            total_trades: int,
+            realized_pnl: float,
+            symbols_traded: List[str],
+    ) -> bool:
+        """Send end-of-day summary."""
+        emoji = "🟢" if realized_pnl >= 0 else "🔴"
+        sign = "+" if realized_pnl >= 0 else ""
+        symbols_str = ", ".join(symbols_traded) if symbols_traded else "None"
+
+        text = (
+            f"📅 <b>Daily Summary</b>  |  <code>{_esc(date_mt5)}</code>\n"
+            f"{_div()}\n"
+            f"{_row('Date', date_mt5)}\n"
+            f"{_row('Trades', total_trades)}\n"
+            f"{_row('P&L', f'{emoji} {sign}${realized_pnl:.2f}')}\n"
+            f"{_row('Symbols', symbols_str)}\n"
             f"{_footer('astra-hawk-2026 | updates')}"
         )
         return self._enqueue(CHANNEL_UPDATES, text, silent=True)
@@ -507,9 +595,9 @@ class TelegramClient:
         text = (
             f"⚠️ <b>Stale Tick</b>  |  <code>{_esc(symbol)}</code>\n"
             f"{_div()}\n"
-            f"{_row('Symbol',       symbol)}\n"
-            f"{_row('Stale For',    f'{stale_seconds}s')}\n"
-            f"{_row('Last Tick',    last_tick_utc)}\n"
+            f"{_row('Symbol', symbol)}\n"
+            f"{_row('Stale For', f'{stale_seconds}s')}\n"
+            f"{_row('Last Tick', last_tick_utc)}\n"
             f"{_footer('astra-hawk-2026 | errors')}"
         )
         return self._enqueue(CHANNEL_ERRORS, text, silent=False)
@@ -532,7 +620,26 @@ class TelegramClient:
             f"💾 <b>Write Failure</b>  |  <code>{_esc(symbol)}</code>\n"
             f"{_div()}\n"
             f"{_row('Symbol', symbol)}\n"
-            f"{_row('Path',   path)}\n"
+            f"{_row('Path', path)}\n"
+            f"<b>Error</b>\n<code>{_esc(error)}</code>\n"
+            f"{_footer('astra-hawk-2026 | errors')}"
+        )
+        return self._enqueue(CHANNEL_ERRORS, text, silent=False)
+
+    def send_order_failure(
+            self,
+            symbol: str,
+            action: str,
+            error: str,
+            retcode: int = 0,
+    ) -> bool:
+        """Send order failure notification."""
+        text = (
+            f"❌ <b>Order Failed</b>  |  <code>{_esc(symbol)}</code>\n"
+            f"{_div()}\n"
+            f"{_row('Symbol', symbol)}\n"
+            f"{_row('Action', action)}\n"
+            f"{_row('Retcode', retcode)}\n"
             f"<b>Error</b>\n<code>{_esc(error)}</code>\n"
             f"{_footer('astra-hawk-2026 | errors')}"
         )
@@ -554,13 +661,13 @@ class TelegramClient:
                     if text.startswith("/status"):
                         notify_telegram("general", "✅ Running")
         """
-        url    = f"{self._cfg.base_url}/getUpdates"
+        url = f"{self._cfg.base_url}/getUpdates"
         params: Dict[str, Any] = {"timeout": timeout}
         if offset is not None:
             params["offset"] = offset
         try:
             data = json.dumps(params).encode("utf-8")
-            req  = urllib.request.Request(
+            req = urllib.request.Request(
                 url, data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -631,22 +738,22 @@ if __name__ == "__main__":
     import os
 
     cfg = TelegramConfig(
-        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        general   = os.environ.get("TELEGRAM_CHAT_GENERAL",  ""),
-        critical  = os.environ.get("TELEGRAM_CHAT_CRITICAL", ""),
-        alerts    = os.environ.get("TELEGRAM_CHAT_ALERTS",   ""),
-        updates   = os.environ.get("TELEGRAM_CHAT_UPDATES",  ""),
-        errors    = os.environ.get("TELEGRAM_CHAT_ERRORS",   ""),
+        bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        general=os.environ.get("TELEGRAM_CHAT_GENERAL", ""),
+        critical=os.environ.get("TELEGRAM_CHAT_CRITICAL", ""),
+        alerts=os.environ.get("TELEGRAM_CHAT_ALERTS", ""),
+        updates=os.environ.get("TELEGRAM_CHAT_UPDATES", ""),
+        errors=os.environ.get("TELEGRAM_CHAT_ERRORS", ""),
     )
 
     init(cfg)
 
     # Plain text — works anywhere
-    notify_telegram("general",  "✅ System started")
+    notify_telegram("general", "✅ System started")
     notify_telegram("critical", "🚨 MT5 disconnected — check terminal")
-    notify_telegram("alerts",   "📥 XAUUSD  ENTRY  BUY  @  5129.24")
-    notify_telegram("updates",  "🔒 Start price locked: 5140.73")
-    notify_telegram("errors",   "❌ build_price_packet returned None")
+    notify_telegram("alerts", "📥 XAUUSD  ENTRY  BUY  @  5129.24")
+    notify_telegram("updates", "🔒 Start price locked: 5140.73")
+    notify_telegram("errors", "❌ build_price_packet returned None")
 
     # Rich structured messages
     client = get_client()
