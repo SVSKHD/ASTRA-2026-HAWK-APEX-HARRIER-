@@ -112,6 +112,7 @@ def _zone_id(date_mt5: str, direction: str) -> Optional[int]:
         return None
     return int(date_mt5.replace("-", "")) * 10 + (1 if direction == "long" else 2)
 
+
 def _exit_targets_from_entry(lvl: Dict[str, float], pos: PositionInfo) -> Dict[str, Optional[float]]:
     """
     Convert threshold-based intended move into actual-entry-based exit targets.
@@ -125,7 +126,6 @@ def _exit_targets_from_entry(lvl: Dict[str, float], pos: PositionInfo) -> Dict[s
             "late_short_tp": None,
         }
 
-    # Intended moves from the threshold ladder
     normal_long_move = float(lvl["long_second_close"]) - float(lvl["long_first"])
     normal_short_move = float(lvl["short_first"]) - float(lvl["short_second_close"])
 
@@ -140,6 +140,7 @@ def _exit_targets_from_entry(lvl: Dict[str, float], pos: PositionInfo) -> Dict[s
         "late_long_tp": ep + late_long_move,
         "late_short_tp": ep - late_short_move,
     }
+
 
 class AstraHawkStrategy(BaseStrategy):
 
@@ -188,6 +189,7 @@ class AstraHawkStrategy(BaseStrategy):
         thr = self._thr
         lvl = _levels(sc, thr.start_price)
         exit_targets = _exit_targets_from_entry(lvl, pos)
+
         x_up_now, x_dn_now, x_up_ext, x_dn_ext = _x_values(
             thr.start_price, pkt.mid, pkt.high, pkt.low, sc.pip_size, sc.threshold
         )

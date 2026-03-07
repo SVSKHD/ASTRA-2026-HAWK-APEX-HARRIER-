@@ -51,7 +51,12 @@ def get_strategy(name: str) -> BaseStrategy:
             f"Available: {list(_LOADERS.keys())}. "
             f"Register it in strategy/loader.py."
         )
-    return loader()()     # loader() → class,  class() → instance
+    return loader()()
+
+
+def load_strategy(name: str) -> BaseStrategy:
+    """Alias for compatibility with runner/executor imports."""
+    return get_strategy(name)
 
 
 def available_strategies() -> List[str]:

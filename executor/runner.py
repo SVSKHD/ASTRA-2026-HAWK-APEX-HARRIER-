@@ -1,391 +1,92 @@
-# executor/engine.py
 from __future__ import annotations
 
-"""
-Execution engine.
-
-Takes a StrategyResult (pure decision from strategy layer)
-→ validates risk gates
-→ places MT5 order (or stubs for MONITOR_ONLY / BACKTEST)
-→ returns ExecResult
-
-MT5 calls are isolated in _place_order() / _close_positions().
-Swap those stubs with real trade.py calls when going ACTIVE.
-"""
-
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Tuple
+import time
+from typing import Dict, Tuple
 
 from config.symbols import SYMBOLS
-from strategy.base  import StrategyResult
-from .price_reader  import PricePacket
+from config.selectors import get_price_symbols, get_strategies_for_symbol
+from strategy.base import PositionInfo
+from strategy.loader import get_strategy
+
+from .price_reader import read_price_packet
+from .engine import EngineState, handle_signal
 
 
-# ---------------------------------------------------------------------------
-# Risk limits — pulled from env or hardcoded here
-# ---------------------------------------------------------------------------
+class ExecutorRunner:
+    def __init__(self, mode: str = "MONITOR_ONLY", poll_seconds: float = 0.3):
+        self.mode = mode
+        self.poll_seconds = poll_seconds
+        self._states: Dict[Tuple[str, str], EngineState] = {}
+        self._strategies = {}
 
-import os
+    def get_state(self, symbol: str, strategy_name: str) -> EngineState:
+        key = (symbol, strategy_name)
+        if key not in self._states:
+            self._states[key] = EngineState(symbol=symbol, strategy=strategy_name)
+        return self._states[key]
 
-DAILY_PROFIT_LOCK_USD = float(os.environ.get("DAILY_PROFIT_LOCK_USD",  50.0))
-DAILY_MAX_LOSS_USD    = float(os.environ.get("DAILY_MAX_LOSS_USD",     -30.0))
-CATASTROPHIC_LOSS_USD = float(os.environ.get("CATASTROPHIC_LOSS_USD",  -75.0))
+    def get_strategy(self, symbol: str, strategy_name: str):
+        key = (symbol, strategy_name)
+        if key not in self._strategies:
+            sc = SYMBOLS[symbol]
+            strategy = get_strategy(strategy_name)
+            strategy.init(symbol, sc)
+            self._strategies[key] = strategy
+        return self._strategies[key]
 
-TRADE_RETCODE_DONE = 10009
+    def process_symbol_strategy(self, symbol: str, strategy_name: str):
+        pkt = read_price_packet(symbol)
+        if pkt is None:
+            return None
 
+        sc = SYMBOLS.get(symbol)
+        if sc is None:
+            return None
 
-# ---------------------------------------------------------------------------
-# ExecResult — what the runner logs / notifies on
-# ---------------------------------------------------------------------------
+        strategy = self.get_strategy(symbol, strategy_name)
+        eng = self.get_state(symbol, strategy_name)
 
-@dataclass
-class ExecResult:
-    symbol:       str
-    strategy:     str
-    decision:     str
-    action:       str       # trade_opened | trade_closed | risk_forced_closed
-                            # monitor_only_entry | sim_opened | blocked_* | none
-    mode:         str
-    did_trade:    bool      = False
-    block_reason: Optional[str] = None
+        if eng.last_date_mt5 != pkt.date_mt5:
+            eng.last_date_mt5 = pkt.date_mt5
+            eng.reset_daily()
+            strategy.on_new_day(pkt.start_price)
 
-    side:         Optional[str]   = None
-    entry_price:  Optional[float] = None
-    exit_price:   Optional[float] = None
-    entry_mode:   Optional[str]   = None
-
-    profit_usd:          float = 0.0
-    realized_profit_usd: float = 0.0
-    daily_done:          bool  = False
-
-    zone_id:  Optional[int] = None
-    now_iso:  str           = ""
-
-    telemetry: Dict[str, Any] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Per-strategy execution state (owned by engine, not strategy)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class EngineState:
-    """
-    Tracks order/position state from the executor's perspective.
-    One instance per (symbol, strategy) pair.
-    Lives in the runner — persisted separately from strategy state.
-    """
-    symbol:   str
-    strategy: str
-
-    in_trade:            bool  = False
-    side:                Optional[str]   = None
-    entry_price:         Optional[float] = None
-    entry_time:          Optional[str]   = None
-    daily_done:          bool  = False
-    realized_profit_usd: float = 0.0
-    order_in_flight:     bool  = False
-
-    def reset(self) -> None:
-        self.in_trade            = False
-        self.side                = None
-        self.entry_price         = None
-        self.entry_time          = None
-        self.daily_done          = False
-        self.realized_profit_usd = 0.0
-        self.order_in_flight     = False
-
-
-# ---------------------------------------------------------------------------
-# MT5 stubs
-# Replace each function body with real trade.py call for ACTIVE mode.
-# ---------------------------------------------------------------------------
-
-def _place_order(symbol: str, side: str, comment: str) -> Dict[str, Any]:
-    """
-    Stub. Replace with:
-        from trade import place_market_order_fok
-        return place_market_order_fok(symbol=symbol, side=side, comment=comment)
-    """
-    sc = SYMBOLS.get(symbol)
-    return {
-        "retcode": TRADE_RETCODE_DONE,
-        "price":   0.0,
-        "volume":  sc.lot_size if sc else 0.01,
-        "comment": comment,
-        "_stub":   True,
-    }
-
-
-def _close_positions(symbol: str, comment: str) -> Dict[str, Any]:
-    """
-    Stub. Replace with:
-        from trade import close_all_positions_fok
-        return close_all_positions_fok(symbol=symbol, comment=comment)
-    """
-    return {"retcode": TRADE_RETCODE_DONE, "closed": True,
-            "_stub": True, "comment": comment}
-
-
-def _get_floating_pnl(symbol: str) -> float:
-    """
-    Stub. Replace with:
-        from trade import get_positions_snapshot
-        snap = get_positions_snapshot(symbol)
-        return float(snap.get("total_profit_usd", 0.0))
-    """
-    return 0.0
-
-
-def _get_realized_pnl(symbol: str) -> float:
-    """
-    Stub. Replace with:
-        from trade import get_realized_profit_since
-        return get_realized_profit_since(symbol, since_dt)
-    """
-    return 0.0
-
-
-# ---------------------------------------------------------------------------
-# Risk gate
-# ---------------------------------------------------------------------------
-
-def _risk_gate(eng: EngineState) -> Tuple[bool, str]:
-    realized = eng.realized_profit_usd
-    floating = _get_floating_pnl(eng.symbol)
-    total    = realized + floating
-
-    if realized >= DAILY_PROFIT_LOCK_USD:
-        return False, f"profit_lock realized={realized:.2f}>={DAILY_PROFIT_LOCK_USD}"
-    if total <= DAILY_MAX_LOSS_USD:
-        return False, f"daily_max_loss total={total:.2f}<={DAILY_MAX_LOSS_USD}"
-    if total <= CATASTROPHIC_LOSS_USD:
-        return False, f"catastrophic_loss total={total:.2f}<={CATASTROPHIC_LOSS_USD}"
-
-    return True, "ok"
-
-
-# ---------------------------------------------------------------------------
-# Main engine function
-# ---------------------------------------------------------------------------
-
-ENTRY_DECISIONS = frozenset({
-    "ENTER_FIRST_LONG", "ENTER_FIRST_SHORT",
-    "ENTER_LATE_LONG",  "ENTER_LATE_SHORT",
-})
-EXIT_DECISIONS = frozenset({
-    "EXIT_SECOND_LONG",  "EXIT_SECOND_SHORT",
-    "EXIT_LATE_LONG",    "EXIT_LATE_SHORT",
-})
-
-
-def handle_signal(
-    mode:     str,              # ACTIVE | MONITOR_ONLY | BACKTEST
-    eng:      EngineState,      # executor-owned order state
-    sig:      StrategyResult,   # decision from strategy.on_tick()
-    pkt:      PricePacket,
-) -> ExecResult:
-    """
-    Translates a strategy decision into an order action.
-    Mutates `eng` in place. Returns ExecResult for runner to log/notify.
-    """
-    current  = float(pkt.mid)
-    sc       = SYMBOLS.get(sig.symbol)
-    now_iso  = sig.now_iso or datetime.now(timezone.utc).isoformat()
-
-    def _r(action: str, did_trade: bool = False,
-           block_reason: Optional[str] = None, **kw) -> ExecResult:
-        return ExecResult(
-            symbol               = sig.symbol,
-            strategy             = sig.strategy,
-            decision             = sig.decision,
-            action               = action,
-            mode                 = mode,
-            did_trade            = did_trade,
-            block_reason         = block_reason,
-            realized_profit_usd  = eng.realized_profit_usd,
-            daily_done           = eng.daily_done,
-            zone_id              = sig.zone_id,
-            now_iso              = now_iso,
-            telemetry            = sig.telemetry or {},
-            **kw,
+        pos = PositionInfo(
+            in_trade=eng.in_trade,
+            side=eng.side,
+            entry_price=eng.entry_price,
+            entry_time=eng.entry_time,
+            entry_mode=eng.entry_mode,
+            daily_done=eng.daily_done,
+            trades_today=eng.trades_today,
         )
 
-    # ── pass-through non-actionable decisions immediately ────────────────
-    if sig.decision in ("WAIT", "HALT_NOT_TRADEABLE") or \
-       sig.decision.startswith("SKIP_") or \
-       sig.action in ("waiting", "holding", "skip", "halt_not_tradeable",
-                      "blocked_daily_done", "blocked_max_trades",
-                      "blocked_one_trade_per_day"):
-        return _r(sig.action or "none")
+        sig = strategy.on_tick(pkt, pos)
 
-    # ── guards ───────────────────────────────────────────────────────────
-    if eng.daily_done and not eng.in_trade:
-        return _r("blocked_daily_done", block_reason="daily_done")
-
-    if mode not in ("ACTIVE", "MONITOR_ONLY", "BACKTEST"):
-        return _r("blocked_unknown_mode", block_reason=f"mode={mode}")
-
-    # ====================================================================
-    # ENTRY
-    # ====================================================================
-    if sig.decision in ENTRY_DECISIONS:
-
-        if eng.in_trade:
-            return _r("skip_already_in_trade", block_reason="already_in_trade")
-
-        if eng.order_in_flight:
-            return _r("blocked_order_in_flight", block_reason="order_in_flight")
-
-        # risk gate
-        allowed, reason = _risk_gate(eng)
-        if not allowed:
-            if "daily_max_loss" in reason or "catastrophic" in reason:
-                return _force_close(mode, eng, sig.symbol, now_iso, _r,
-                                    "ASTRA_RISK_FORCE_CLOSE_GATE")
-            return _r("blocked_risk", block_reason=reason)
-
-        side       = sig.side or ("buy" if "LONG" in sig.decision else "sell")
-        entry_mode = sig.entry_mode or ("late" if "LATE" in sig.decision else "normal")
-        comment    = f"ASTRA_HAWK_{'LATE' if entry_mode == 'late' else '1X'}"
-
-        # ── MONITOR_ONLY ──────────────────────────────────────────────
-        if mode == "MONITOR_ONLY":
-            eng.in_trade    = True
-            eng.side        = side
-            eng.entry_price = current
-            eng.entry_time  = now_iso
-            return _r("monitor_only_entry", did_trade=False,
-                      side=side, entry_price=current, entry_mode=entry_mode)
-
-        # ── BACKTEST ──────────────────────────────────────────────────
-        if mode == "BACKTEST":
-            eng.in_trade    = True
-            eng.side        = side
-            eng.entry_price = current
-            eng.entry_time  = now_iso
-            return _r("sim_opened", did_trade=True,
-                      side=side, entry_price=current, entry_mode=entry_mode)
-
-        # ── ACTIVE ────────────────────────────────────────────────────
-        eng.order_in_flight = True
         try:
-            order = _place_order(sig.symbol, side, comment)
-        except Exception as e:
-            return _r("order_failed", block_reason=f"{type(e).__name__}:{e}")
-        finally:
-            eng.order_in_flight = False
+            strategy_state = strategy.build_state()
+            _ = strategy_state
+        except Exception:
+            pass
 
-        ret = order.get("retcode") if isinstance(order, dict) else None
-        if ret is None or int(ret) != TRADE_RETCODE_DONE:
-            return _r("order_rejected", block_reason=f"retcode={ret}")
+        result = handle_signal(self.mode, eng, sig, pkt)
+        return result
 
-        confirmed = float(order.get("price") or current)
-        eng.in_trade    = True
-        eng.side        = side
-        eng.entry_price = confirmed
-        eng.entry_time  = now_iso
-        return _r("trade_opened", did_trade=True,
-                  side=side, entry_price=confirmed, entry_mode=entry_mode)
+    def run_once(self):
+        results = []
+        for symbol in get_price_symbols():
+            for strategy_name in get_strategies_for_symbol(symbol):
+                res = self.process_symbol_strategy(symbol, strategy_name)
+                if res is not None:
+                    results.append(res)
+        return results
 
-    # ====================================================================
-    # EXIT
-    # ====================================================================
-    if sig.decision in EXIT_DECISIONS:
-
-        if not eng.in_trade:
-            return _r("skip_not_in_trade", block_reason="not_in_trade")
-
-        side_before  = eng.side
-        entry_before = eng.entry_price
-        is_late      = "LATE" in sig.decision
-        comment      = f"ASTRA_HAWK_EXIT_{'LATE' if is_late else '2ND'}"
-
-        # ── MONITOR_ONLY ──────────────────────────────────────────────
-        if mode == "MONITOR_ONLY":
-            eng.in_trade    = False
-            eng.side        = None
-            eng.entry_price = None
-            eng.daily_done  = True
-            return _r("monitor_only_exit", did_trade=False, daily_done=True,
-                      side=side_before, entry_price=entry_before,
-                      exit_price=current)
-
-        # ── BACKTEST ──────────────────────────────────────────────────
-        if mode == "BACKTEST":
-            pnl = _sim_pnl(sig.symbol, side_before, entry_before, current)
-            eng.realized_profit_usd += pnl
-            eng.in_trade    = False
-            eng.side        = None
-            eng.entry_price = None
-            eng.daily_done  = True
-            return _r("sim_closed", did_trade=True, daily_done=True,
-                      profit_usd=pnl,
-                      realized_profit_usd=eng.realized_profit_usd,
-                      side=side_before, entry_price=entry_before,
-                      exit_price=current)
-
-        # ── ACTIVE ────────────────────────────────────────────────────
-        try:
-            _close_positions(sig.symbol, comment)
-        except Exception as e:
-            return _r("close_failed", block_reason=f"{type(e).__name__}:{e}")
-
-        realized = _get_realized_pnl(sig.symbol)
-        eng.realized_profit_usd = float(realized)
-        eng.in_trade    = False
-        eng.side        = None
-        eng.entry_price = None
-        eng.daily_done  = True
-        return _r("trade_closed", did_trade=True, daily_done=True,
-                  profit_usd=float(realized),
-                  realized_profit_usd=float(realized),
-                  side=side_before, entry_price=entry_before,
-                  exit_price=current)
-
-    # ── fallback ─────────────────────────────────────────────────────────
-    return _r("none")
+    def run_loop(self):
+        while True:
+            self.run_once()
+            time.sleep(self.poll_seconds)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _force_close(mode, eng, symbol, now_iso, _r, comment):
-    if mode == "MONITOR_ONLY":
-        eng.daily_done = True
-        eng.in_trade   = False
-        eng.side       = None
-        return _r("monitor_only_force_close", daily_done=True)
-
-    if mode == "BACKTEST":
-        eng.daily_done = True
-        eng.in_trade   = False
-        eng.side       = None
-        return _r("sim_forced_closed", did_trade=True, daily_done=True)
-
-    try:
-        _close_positions(symbol, comment)
-    except Exception as e:
-        return _r("risk_force_close_failed",
-                  block_reason=f"close_exception:{e}")
-
-    realized = _get_realized_pnl(symbol)
-    eng.realized_profit_usd = float(realized)
-    eng.daily_done = True
-    eng.in_trade   = False
-    eng.side       = None
-    return _r("risk_forced_closed", did_trade=True, daily_done=True,
-              profit_usd=float(realized),
-              realized_profit_usd=float(realized))
-
-
-def _sim_pnl(symbol: str, side, entry, current: float) -> float:
-    if entry is None:
-        return 0.0
-    sc = SYMBOLS.get(symbol)
-    if sc is None or sc.pip_size <= 0:
-        return 0.0
-    pips = ((current - entry) if side == "buy" else (entry - current)) / sc.pip_size
-    return round(pips * sc.lot_size * 10.0, 2)
+if __name__ == "__main__":
+    runner = ExecutorRunner(mode="MONITOR_ONLY", poll_seconds=0.3)
+    runner.run_loop()
