@@ -1,7 +1,8 @@
-# start_price.py
 from __future__ import annotations
 
+import os
 import time
+import threading
 from datetime import datetime, timezone
 
 import MetaTrader5 as mt5
@@ -18,8 +19,18 @@ from storage import (
     resolve_start_emergency_path,
     append_line,
 )
-import threading
 from config import get_enabled_symbols
+from notify import (
+    init_discord,
+    init_telegram,
+    DiscordConfig,
+    TelegramConfig,
+    notify_rollover,
+    notify_start_locked,
+    _safe_broadcast,
+    CHANNEL_ERRORS,
+)
+import os
 
 MIDNIGHT_GRACE_MINUTES = 10
 STALE_AFTER_SECONDS = 20  # tune: 10–60
@@ -127,6 +138,8 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
     last_tick_change_monotonic = time.time()
 
     last_locked_date: str | None = None
+    last_start_error_notify_ts = 0.0
+    start_error_notify_interval = 300.0  # 5 min
 
     em_path = resolve_start_emergency_path(cfg.base_dir, symbol)
 
@@ -155,15 +168,11 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
         day_file_exists = payload is not None
         payload = payload or default_payload(symbol, date_mt5)
 
-        # ✅ always enforce schema
         payload.setdefault("start", _reset_start_block())
 
         payload["tz"]["server"] = str(cfg.server_tz)
         payload["tz"]["local"] = getattr(cfg.local_tz, "key", None) or str(cfg.local_tz)
 
-        # -----------------------
-        # ✅ ROLLOVER HANDLING
-        # -----------------------
         if last_date_mt5 is None:
             last_date_mt5 = date_mt5
         elif date_mt5 != last_date_mt5:
@@ -181,26 +190,31 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
 
             payload["meta"]["rollover_detected"] = True
             payload["meta"]["last_rollover_from"] = old
-
-            # Reset start block for new day
             payload["start"] = _reset_start_block()
 
-            # Reset stale tracking
             last_tick_epoch = None
             last_tick_change_monotonic = time.time()
 
             append_line(
                 em_path,
-                f"{new} | ROLLOVER | from={old} -> to={new} | "
-                f"tick={iso_z(clk.tick_time_utc)}"
+                f"{new} | ROLLOVER | from={old} -> to={new} | tick={iso_z(clk.tick_time_utc)}"
             )
+
+            try:
+                notify_rollover(
+                    symbol=symbol,
+                    old_date=old,
+                    new_date=new,
+                    tick_utc=iso_z(clk.tick_time_utc),
+                    server_time=server_dt.isoformat(),
+                    local_time=local_dt.isoformat(),
+                )
+            except Exception:
+                pass
 
             last_date_mt5 = new
             last_locked_date = None
 
-        # -----------------------
-        # STALE DETECTION
-        # -----------------------
         now_mono = time.time()
         if last_tick_epoch is None:
             last_tick_epoch = tick.time
@@ -224,12 +238,6 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
 
         start = payload.get("start") or _reset_start_block()
 
-        # -----------------------
-        # ✅ LOCK POLICY
-        # -----------------------
-        # If day file already exists: allow lock (normal run).
-        # If day file doesn't exist: ONLY allow lock within midnight grace,
-        # to avoid "random time start price" on midday restarts.
         allow_lock_now = day_file_exists or _within_midnight_grace(clk) or cfg.allow_bootstrap_lock
 
         if start.get("status") != "LOCKED" and allow_lock_now and (not is_stale):
@@ -272,6 +280,20 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
                     f"LOCAL={payload['start']['locked_local_time']} | "
                     f"SOURCE={payload['start']['source']}"
                 )
+
+                try:
+                    notify_start_locked(
+                        symbol=symbol,
+                        date_mt5=date_mt5,
+                        price=float(payload["start"]["price"]),
+                        tick_time_utc=payload["start"]["locked_tick_time_utc"],
+                        server_time=payload["start"]["locked_server_time"],
+                        local_time=payload["start"]["locked_local_time"],
+                        source=payload["start"]["source"],
+                    )
+                except Exception:
+                    pass
+
                 last_locked_date = date_mt5
 
         now = time.time()
@@ -289,10 +311,85 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
             )
             last_status_print = now
 
+        if payload["start"]["status"] != "LOCKED":
+            now_err = time.time()
+            if now_err - last_start_error_notify_ts >= start_error_notify_interval:
+                reason = []
+                if is_stale:
+                    reason.append(f"stale_tick={int(stale_for)}s")
+                if not allow_lock_now:
+                    reason.append("lock_window_not_allowed")
+                if not lock_window_ok(cfg, clk.time_mt5_hhmm):
+                    reason.append(f"before_lock_hhmm={cfg.lock_hhmm_mt5}")
+                if payload["start"]["price"] is None:
+                    reason.append("start_price_none")
+
+                reason_text = ", ".join(reason) if reason else "pending_lock"
+
+                try:
+                    _safe_broadcast(
+                        channel=CHANNEL_ERRORS,
+                        message=(
+                            f"⚠️ START NOT LOCKED — {symbol}\n"
+                            f"DATE: {date_mt5}\n"
+                            f"MT5: {iso_z(clk.tick_time_utc)}\n"
+                            f"SERVER: {server_dt.isoformat()}\n"
+                            f"LOCAL: {local_dt.isoformat()}\n"
+                            f"STATUS: {payload['start']['status']}\n"
+                            f"MID: {mid}\n"
+                            f"REASON: {reason_text}"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+                last_start_error_notify_ts = now_err
+
         time.sleep(cfg.poll_seconds)
 
-if __name__ == "__main__":
+def init_notifiers():
+    try:
+        discord_cfg = DiscordConfig(
+            general=os.environ.get("DISCORD_WEBHOOK_GENERAL", ""),
+            critical=os.environ.get("DISCORD_WEBHOOK_CRITICAL", ""),
+            alerts=os.environ.get("DISCORD_WEBHOOK_ALERTS", ""),
+            updates=os.environ.get("DISCORD_WEBHOOK_UPDATES", ""),
+            errors=os.environ.get("DISCORD_WEBHOOK_ERRORS", ""),
+        )
+        if any([
+            discord_cfg.general,
+            discord_cfg.critical,
+            discord_cfg.alerts,
+            discord_cfg.updates,
+            discord_cfg.errors,
+        ]):
+            init_discord(discord_cfg)
+            print("✅ Discord initialised")
+        else:
+            print("⚠️ Discord init skipped: no webhook config")
+    except Exception as e:
+        print(f"⚠️ Discord init failed: {e}")
 
+    try:
+        telegram_cfg = TelegramConfig(
+            bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            general=os.environ.get("TELEGRAM_CHAT_GENERAL", ""),
+            critical=os.environ.get("TELEGRAM_CHAT_CRITICAL", ""),
+            alerts=os.environ.get("TELEGRAM_CHAT_ALERTS", ""),
+            updates=os.environ.get("TELEGRAM_CHAT_UPDATES", ""),
+            errors=os.environ.get("TELEGRAM_CHAT_ERRORS", ""),
+        )
+        if telegram_cfg.bot_token:
+            init_telegram(telegram_cfg)
+            print("✅ Telegram initialised")
+        else:
+            print("⚠️ Telegram init skipped: no bot token")
+    except Exception as e:
+        print(f"⚠️ Telegram init failed: {e}")
+
+
+if __name__ == "__main__":
+    init_notifiers()
 
     cfg = PriceSettings()
     symbols = get_enabled_symbols()

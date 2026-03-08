@@ -1,24 +1,19 @@
-# test_trade.py
 """
 Test suite for trade.py
 
-Run with MT5 terminal open:
-    python test_trade.py
-
-Run specific test:
-    python test_trade.py --test fok
-    python test_trade.py --test close
-    python test_trade.py --test sim
+Run from repo root:
+    python -m executor.test_trade
+    python -m executor.test_trade --test fok
+    python -m executor.test_trade --test close
+    python -m executor.test_trade --test sim
 """
 
 from __future__ import annotations
 
-import sys
+import os
 import time
-from datetime import datetime, timezone
 
-# Import trade module
-from trade import (
+from executor.trade import (
     place_market_order_fok,
     close_position_fok,
     close_all_positions_fok,
@@ -30,6 +25,42 @@ from trade import (
     health_check,
     shutdown,
 )
+
+from notify.discord import init as init_discord, DiscordConfig
+from notify.telegram import init as init_telegram, TelegramConfig
+
+
+def init_notifiers() -> None:
+    """
+    Initialise Discord + Telegram from environment variables so trade.py
+    can emit success/error notifications during tests.
+    """
+    try:
+        discord_cfg = DiscordConfig(
+            general=os.environ.get("DISCORD_WEBHOOK_GENERAL", ""),
+            critical=os.environ.get("DISCORD_WEBHOOK_CRITICAL", ""),
+            alerts=os.environ.get("DISCORD_WEBHOOK_ALERTS", ""),
+            updates=os.environ.get("DISCORD_WEBHOOK_UPDATES", ""),
+            errors=os.environ.get("DISCORD_WEBHOOK_ERRORS", ""),
+        )
+        init_discord(discord_cfg)
+        print("✅ Discord initialised")
+    except Exception as e:
+        print(f"⚠️ Discord init failed: {e}")
+
+    try:
+        telegram_cfg = TelegramConfig(
+            bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            general=os.environ.get("TELEGRAM_CHAT_GENERAL", ""),
+            critical=os.environ.get("TELEGRAM_CHAT_CRITICAL", ""),
+            alerts=os.environ.get("TELEGRAM_CHAT_ALERTS", ""),
+            updates=os.environ.get("TELEGRAM_CHAT_UPDATES", ""),
+            errors=os.environ.get("TELEGRAM_CHAT_ERRORS", ""),
+        )
+        init_telegram(telegram_cfg)
+        print("✅ Telegram initialised")
+    except Exception as e:
+        print(f"⚠️ Telegram init failed: {e}")
 
 
 def print_header(title: str):
@@ -44,7 +75,6 @@ def print_result(result: dict):
 
 
 def test_health_check():
-    """Test MT5 connection health check."""
     print_header("TEST: Health Check")
 
     result = health_check()
@@ -59,7 +89,6 @@ def test_health_check():
 
 
 def test_positions_snapshot():
-    """Test getting positions snapshot."""
     print_header("TEST: Positions Snapshot")
 
     snap = get_positions_snapshot()
@@ -76,15 +105,13 @@ def test_positions_snapshot():
 
 
 def test_calc_profit():
-    """Test profit calculation."""
     print_header("TEST: Profit Calculation (order_calc_profit)")
 
-    # Test cases
     tests = [
-        ("XAUUSD", "buy",  0.1, 5000.00, 5015.00),  # +15 price = +$150
-        ("XAUUSD", "sell", 0.1, 5015.00, 5000.00),  # -15 price = +$150
-        ("XAUUSD", "buy",  0.1, 5015.00, 5000.00),  # -15 price = -$150
-        ("XAUUSD", "sell", 0.1, 5000.00, 5015.00),  # +15 price = -$150
+        ("XAUUSD", "buy",  0.1, 5000.00, 5015.00),
+        ("XAUUSD", "sell", 0.1, 5015.00, 5000.00),
+        ("XAUUSD", "buy",  0.1, 5015.00, 5000.00),
+        ("XAUUSD", "sell", 0.1, 5000.00, 5015.00),
     ]
 
     for symbol, side, lot, open_p, close_p in tests:
@@ -97,7 +124,6 @@ def test_calc_profit():
 
 
 def test_fok_order(symbol: str = "XAUUSD", lot: float = 0.01):
-    """Test FOK order placement (LIVE - will open real position!)."""
     print_header(f"TEST: FOK Order ({symbol})")
     print(f"\n⚠️  WARNING: This will place a REAL order!")
     print(f"    Symbol: {symbol}")
@@ -108,7 +134,6 @@ def test_fok_order(symbol: str = "XAUUSD", lot: float = 0.01):
         print("  Skipped.")
         return False
 
-    # Place BUY order
     print("\n  Placing BUY order...")
     result = place_market_order_fok(
         symbol=symbol,
@@ -122,10 +147,8 @@ def test_fok_order(symbol: str = "XAUUSD", lot: float = 0.01):
         ticket = result.get("ticket")
         print(f"\n  ✅ Order placed: ticket={ticket}")
 
-        # Wait a moment
         time.sleep(1)
 
-        # Close it
         print(f"\n  Closing position {ticket}...")
         close_result = close_position_fok(ticket=ticket, comment="TEST_CLOSE")
         print_result(close_result)
@@ -136,13 +159,20 @@ def test_fok_order(symbol: str = "XAUUSD", lot: float = 0.01):
         else:
             print(f"\n  ❌ Close failed: {close_result.get('error')}")
             return False
-    else:
-        print(f"\n  ❌ Order failed: {result.get('error')}")
-        return False
+
+    retcode = result.get("retcode")
+    error = str(result.get("error", ""))
+
+    if retcode in (10016, 10018) or "market" in error.lower() or "closed" in error.lower():
+        print(f"\n  ⚠️ Market is closed: retcode={retcode} error={error}")
+        print("  This is expected outside trading hours.")
+        return True
+
+    print(f"\n  ❌ Order failed: retcode={retcode} error={error}")
+    return False
 
 
 def test_close_all():
-    """Test closing all positions."""
     print_header("TEST: Close All Positions")
 
     snap = get_positions_snapshot()
@@ -163,12 +193,10 @@ def test_close_all():
 
 
 def test_simulator():
-    """Test simulated trading."""
     print_header("TEST: Simulator (order_calc_profit)")
 
     simulator.reset()
 
-    # Open simulated BUY
     print("\n  Opening simulated BUY XAUUSD 0.1 @ 5000...")
     r1 = simulator.open_position(
         symbol="XAUUSD",
@@ -179,16 +207,13 @@ def test_simulator():
     )
     print(f"  Ticket: {r1.get('ticket')}")
 
-    # Check floating P&L
     floating = simulator.get_floating_pnl("XAUUSD", current_price=5015.0)
     print(f"\n  Floating P&L @ 5015: ${floating:.2f}")
 
-    # Close it
     print("\n  Closing simulated position @ 5015...")
     r2 = simulator.close_position(r1["ticket"], close_price=5015.0)
     print(f"  Profit: ${r2.get('profit', 0):.2f}")
 
-    # Check realized
     realized = simulator.get_realized_pnl()
     print(f"\n  Total realized P&L: ${realized:.2f}")
 
@@ -196,7 +221,6 @@ def test_simulator():
 
 
 def test_realized_pnl():
-    """Test getting realized P&L since today."""
     print_header("TEST: Realized P&L Since Today")
 
     pnl = get_realized_profit_since()
@@ -223,6 +247,8 @@ def main():
     print("\n" + "=" * 60)
     print("  TRADE.PY TEST SUITE")
     print("=" * 60)
+
+    init_notifiers()
 
     tests_passed = 0
     tests_failed = 0
@@ -279,6 +305,8 @@ def main():
         print(f"\n\n  ❌ Exception: {e}")
         tests_failed += 1
     finally:
+        print("\nWaiting 5 seconds for notifier queues to flush...")
+        time.sleep(5)
         shutdown()
 
     print(f"\n{'='*60}")

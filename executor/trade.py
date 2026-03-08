@@ -1,47 +1,151 @@
-# trade.py
 from __future__ import annotations
 
 """
 MT5 Trade Execution Module — FOK Orders with Retry
 
-Public API (matches executor/runner.py stubs):
-    place_market_order_fok(symbol, side, lot, comment) → dict
-    close_all_positions_fok(symbol, comment)           → dict
-    close_position_fok(ticket, comment)                → dict
-    get_positions_snapshot(symbol)                     → dict
-    get_realized_profit_since(symbol, since_dt)        → float
+Public API:
+    place_market_order_fok(symbol, side, lot, comment) -> dict
+    close_all_positions_fok(symbol, comment)           -> dict
+    close_position_fok(ticket, comment)                -> dict
+    get_positions_snapshot(symbol)                     -> dict
+    get_realized_profit_since(symbol, since_dt)        -> float
 
 Simulation:
-    calc_profit(symbol, side, lot, open_price, close_price) → float
-
-Internal:
-    _ensure_mt5()           — init with retry
-    _ensure_symbol(symbol)  — select symbol in MarketWatch
-    _retry(func, ...)       — retry wrapper for transient failures
+    calc_profit(symbol, side, lot, open_price, close_price) -> float
 """
 
 import time
 import functools
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import MetaTrader5 as mt5
 
-from config.symbols import SYMBOLS, SymbolConfig
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
+from config import SYMBOLS
+from notify import (
+    get_discord_client,
+    get_telegram_client,
+    notify_discord,
+    notify_telegram,
+    CHANNEL_ALERTS,
+    CHANNEL_ERRORS,
+)
 from core.logger import get_logger
 
 logger = get_logger("trade")
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+def _safe_notify_success(
+    *,
+    symbol: str,
+    action: str,
+    direction: str,
+    price: float,
+    lots: float,
+    reason: str = "",
+    profit: Optional[float] = None,
+    ticket: Optional[int] = None,
+) -> None:
+    """Fire-and-forget success notification to Discord and Telegram."""
+    try:
+        dc = get_discord_client()
+        dc.send_trade_alert(
+            symbol=symbol,
+            action=action,
+            direction=direction.upper(),
+            price=price,
+            lots=lots,
+            reason=reason,
+            profit=profit,
+            ticket=ticket,
+        )
+    except Exception as e:
+        logger.warning(f"Discord success notify failed: {e!r}")
+        try:
+            notify_discord(
+                CHANNEL_ALERTS,
+                f"{action} {symbol} {direction.upper()} @ {price} | "
+                f"lots={lots} | ticket={ticket or '-'} | "
+                f"profit={profit if profit is not None else '-'} | "
+                f"reason={reason or '-'}"
+            )
+        except Exception:
+            pass
+
+    try:
+        tc = get_telegram_client()
+        tc.send_trade_alert(
+            symbol=symbol,
+            action=action,
+            direction=direction.upper(),
+            price=price,
+            lots=lots,
+            reason=reason,
+            profit=profit,
+            ticket=ticket,
+        )
+    except Exception as e:
+        logger.warning(f"Telegram success notify failed: {e!r}")
+        try:
+            notify_telegram(
+                CHANNEL_ALERTS,
+                f"{action} {symbol} {direction.upper()} @ {price} | "
+                f"lots={lots} | ticket={ticket or '-'} | "
+                f"profit={profit if profit is not None else '-'} | "
+                f"reason={reason or '-'}"
+            )
+        except Exception:
+            pass
+
+
+def _safe_notify_error(
+    *,
+    symbol: str,
+    action: str,
+    error: str,
+    retcode: int = 0,
+    context: str = "",
+) -> None:
+    """Fire-and-forget error notification to Discord and Telegram."""
+    try:
+        dc = get_discord_client()
+        dc.send_error(
+            symbol=symbol or "TRADE",
+            error=f"{action} failed | retcode={retcode} | {error}",
+            context=context,
+            source="trade",
+        )
+    except Exception as e:
+        logger.warning(f"Discord error notify failed: {e!r}")
+        try:
+            notify_discord(
+                CHANNEL_ERRORS,
+                f"❌ {action} failed | symbol={symbol or '-'} | "
+                f"retcode={retcode} | {error}"
+            )
+        except Exception:
+            pass
+
+    try:
+        tc = get_telegram_client()
+        tc.send_order_failure(
+            symbol=symbol or "TRADE",
+            action=action,
+            error=error,
+            retcode=retcode,
+        )
+    except Exception as e:
+        logger.warning(f"Telegram order-failure notify failed: {e!r}")
+        try:
+            notify_telegram(
+                CHANNEL_ERRORS,
+                f"❌ {action} failed | symbol={symbol or '-'} | "
+                f"retcode={retcode} | {error}"
+            )
+        except Exception:
+            pass
+
 
 TRADE_RETCODE_DONE = 10009
 TRADE_RETCODE_REQUOTE = 10004
@@ -52,29 +156,24 @@ RETRIABLE_RETCODES = frozenset({
     TRADE_RETCODE_REQUOTE,
     TRADE_RETCODE_PRICE_CHANGED,
     TRADE_RETCODE_PRICE_OFF,
-    10006,  # TRADE_RETCODE_REJECT (temporary)
-    10007,  # TRADE_RETCODE_CANCEL
-    10013,  # TRADE_RETCODE_INVALID_VOLUME (can be transient)
-    10014,  # TRADE_RETCODE_INVALID_PRICE
-    10015,  # TRADE_RETCODE_INVALID_STOPS
-    10016,  # TRADE_RETCODE_TRADE_DISABLED (market closed, retry later)
-    10018,  # TRADE_RETCODE_MARKET_CLOSED
-    10024,  # TRADE_RETCODE_TOO_MANY_REQUESTS (rate limit)
-    10031,  # TRADE_RETCODE_CONNECTION (connection issue)
+    10006,
+    10007,
+    10013,
+    10014,
+    10015,
+    10016,
+    10018,
+    10024,
+    10031,
 })
 
 DEFAULT_RETRY_ATTEMPTS = 3
-DEFAULT_RETRY_DELAY = 0.3  # seconds
-DEFAULT_DEVIATION = 20     # points slippage
+DEFAULT_RETRY_DELAY = 0.3
+DEFAULT_DEVIATION = 20
 
-
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
 
 @dataclass
 class TradeResult:
-    """Unified result for all trade operations."""
     success: bool
     retcode: int
     symbol: str = ""
@@ -109,18 +208,10 @@ class TradeResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# MT5 Connection Management
-# ---------------------------------------------------------------------------
-
 _mt5_initialized = False
-_mt5_lock = None  # Could add threading.Lock() if needed
+
 
 def _ensure_mt5(max_retries: int = 5, delay: float = 1.0) -> bool:
-    """
-    Initialize MT5 connection with retry.
-    Safe to call multiple times — returns immediately if already connected.
-    """
     global _mt5_initialized
 
     if _mt5_initialized and mt5.terminal_info() is not None:
@@ -134,7 +225,6 @@ def _ensure_mt5(max_retries: int = 5, delay: float = 1.0) -> bool:
 
         err = mt5.last_error()
         logger.warning(f"MT5 init attempt {attempt}/{max_retries} failed: {err}")
-
         if attempt < max_retries:
             time.sleep(delay)
 
@@ -143,10 +233,6 @@ def _ensure_mt5(max_retries: int = 5, delay: float = 1.0) -> bool:
 
 
 def _ensure_symbol(symbol: str) -> bool:
-    """
-    Ensure symbol is visible in MarketWatch for tick streaming.
-    Returns False if symbol doesn't exist.
-    """
     info = mt5.symbol_info(symbol)
     if info is None:
         logger.error(f"Symbol {symbol} not found")
@@ -161,10 +247,6 @@ def _ensure_symbol(symbol: str) -> bool:
 
 
 def _get_tick(symbol: str) -> Optional[Tuple[float, float, float]]:
-    """
-    Get current bid/ask/mid for symbol.
-    Returns (bid, ask, mid) or None.
-    """
     tick = mt5.symbol_info_tick(symbol)
     if tick is None or tick.time == 0:
         return None
@@ -172,31 +254,21 @@ def _get_tick(symbol: str) -> Optional[Tuple[float, float, float]]:
     bid = float(tick.bid)
     ask = float(tick.ask)
     mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
-
     return (bid, ask, mid)
 
 
 def shutdown():
-    """Shutdown MT5 connection."""
     global _mt5_initialized
     mt5.shutdown()
     _mt5_initialized = False
     logger.info("MT5 shutdown")
 
 
-# ---------------------------------------------------------------------------
-# Retry decorator
-# ---------------------------------------------------------------------------
-
 def _retry(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     delay: float = DEFAULT_RETRY_DELAY,
     retriable_codes: frozenset = RETRIABLE_RETCODES,
 ):
-    """
-    Decorator for retrying trade operations on transient failures.
-    Retries if retcode is in retriable_codes.
-    """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> TradeResult:
@@ -211,7 +283,6 @@ def _retry(
 
                 last_result = result
 
-                # Check if retriable
                 if result.retcode not in retriable_codes:
                     logger.warning(
                         f"{func.__name__} failed (non-retriable): "
@@ -219,7 +290,6 @@ def _retry(
                     )
                     return result
 
-                # Retry
                 if attempt < max_attempts:
                     logger.info(
                         f"{func.__name__} retry {attempt}/{max_attempts}: "
@@ -241,10 +311,6 @@ def _retry(
     return decorator
 
 
-# ---------------------------------------------------------------------------
-# FOK Order Execution
-# ---------------------------------------------------------------------------
-
 @_retry(max_attempts=DEFAULT_RETRY_ATTEMPTS, delay=DEFAULT_RETRY_DELAY)
 def _execute_order_fok(
     symbol: str,
@@ -256,11 +322,6 @@ def _execute_order_fok(
     tp: float = 0.0,
     magic: int = 0,
 ) -> TradeResult:
-    """
-    Internal FOK order execution with fresh price fetch.
-    Called by place_market_order_fok after retry wrapper.
-    """
-    # Ensure MT5 connected
     if not _ensure_mt5():
         return TradeResult(
             success=False,
@@ -270,7 +331,6 @@ def _execute_order_fok(
             error="MT5 not initialized",
         )
 
-    # Ensure symbol visible
     if not _ensure_symbol(symbol):
         return TradeResult(
             success=False,
@@ -280,7 +340,6 @@ def _execute_order_fok(
             error=f"Symbol {symbol} not available",
         )
 
-    # Get fresh tick price
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         return TradeResult(
@@ -291,7 +350,6 @@ def _execute_order_fok(
             error="Failed to get tick data",
         )
 
-    # Determine order type and price
     if side.lower() == "buy":
         order_type = mt5.ORDER_TYPE_BUY
         price = tick.ask
@@ -308,7 +366,6 @@ def _execute_order_fok(
             error=f"Invalid price: {price}",
         )
 
-    # Build request
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -319,12 +376,11 @@ def _execute_order_fok(
         "tp": float(tp),
         "deviation": deviation,
         "magic": magic,
-        "comment": comment[:31] if comment else "",  # MT5 limit
+        "comment": comment[:31] if comment else "",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_FOK,
     }
 
-    # Send order
     result = mt5.order_send(request)
 
     if result is None:
@@ -361,23 +417,6 @@ def place_market_order_fok(
     tp: float = 0.0,
     magic: int = 0,
 ) -> Dict[str, Any]:
-    """
-    Place a market order with FOK (Fill or Kill) execution.
-    Price is fetched internally from MT5.
-
-    Args:
-        symbol:  e.g. "XAUUSD"
-        side:    "buy" or "sell"
-        lot:     lot size (uses config default if None)
-        comment: order comment
-        sl:      stop loss price (0 = no SL)
-        tp:      take profit price (0 = no TP)
-        magic:   magic number for EA identification
-
-    Returns:
-        dict with keys: retcode, price, volume, ticket, success, error, _stub
-    """
-    # Get lot from config if not provided
     if lot is None:
         sc = SYMBOLS.get(symbol)
         lot = sc.lot_size if sc else 0.01
@@ -399,18 +438,30 @@ def place_market_order_fok(
             f"✅ FOK {side.upper()} executed: {symbol} {result.volume} lots "
             f"@ {result.price} | ticket={result.ticket}"
         )
+        _safe_notify_success(
+            symbol=symbol,
+            action="ENTRY",
+            direction=side,
+            price=result.price,
+            lots=result.volume or float(lot),
+            reason=comment or "place_market_order_fok",
+            ticket=result.ticket,
+        )
     else:
         logger.error(
             f"❌ FOK {side.upper()} failed: {symbol} | "
             f"retcode={result.retcode} | {result.error} | attempts={result.attempts}"
         )
+        _safe_notify_error(
+            symbol=symbol,
+            action=f"ENTRY_{side.upper()}",
+            error=result.error or "order failed",
+            retcode=result.retcode,
+            context=f"comment={comment} attempts={result.attempts} lot={lot}",
+        )
 
     return result.to_dict()
 
-
-# ---------------------------------------------------------------------------
-# Close Positions
-# ---------------------------------------------------------------------------
 
 @_retry(max_attempts=DEFAULT_RETRY_ATTEMPTS, delay=DEFAULT_RETRY_DELAY)
 def _close_single_position(
@@ -418,7 +469,6 @@ def _close_single_position(
     comment: str = "",
     deviation: int = DEFAULT_DEVIATION,
 ) -> TradeResult:
-    """Close a single position by ticket."""
     if not _ensure_mt5():
         return TradeResult(
             success=False,
@@ -426,7 +476,6 @@ def _close_single_position(
             error="MT5 not initialized",
         )
 
-    # Get position
     positions = mt5.positions_get(ticket=ticket)
     if not positions:
         return TradeResult(
@@ -439,7 +488,6 @@ def _close_single_position(
     pos = positions[0]
     symbol = pos.symbol
 
-    # Get fresh tick
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         return TradeResult(
@@ -450,7 +498,6 @@ def _close_single_position(
             error="Failed to get tick data",
         )
 
-    # Determine close type and price
     if pos.type == mt5.POSITION_TYPE_BUY:
         close_type = mt5.ORDER_TYPE_SELL
         price = tick.bid
@@ -458,7 +505,6 @@ def _close_single_position(
         close_type = mt5.ORDER_TYPE_BUY
         price = tick.ask
 
-    # Build request
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -502,16 +548,6 @@ def _close_single_position(
 
 
 def close_position_fok(ticket: int, comment: str = "") -> Dict[str, Any]:
-    """
-    Close a single position by ticket using FOK.
-
-    Args:
-        ticket:  position ticket number
-        comment: close comment
-
-    Returns:
-        dict with keys: retcode, success, profit, price, error
-    """
     logger.info(f"Closing position ticket={ticket} | comment={comment}")
 
     result = _close_single_position(ticket=ticket, comment=comment)
@@ -521,10 +557,27 @@ def close_position_fok(ticket: int, comment: str = "") -> Dict[str, Any]:
             f"✅ Closed position {ticket}: {result.symbol} "
             f"@ {result.price} | profit={result.profit:.2f}"
         )
+        _safe_notify_success(
+            symbol=result.symbol,
+            action="EXIT",
+            direction=result.side or "close",
+            price=result.price,
+            lots=result.volume,
+            reason=comment or "close_position_fok",
+            profit=result.profit,
+            ticket=ticket,
+        )
     else:
         logger.error(
             f"❌ Close position {ticket} failed: "
             f"retcode={result.retcode} | {result.error}"
+        )
+        _safe_notify_error(
+            symbol=result.symbol,
+            action="CLOSE_POSITION",
+            error=result.error or "close failed",
+            retcode=result.retcode,
+            context=f"ticket={ticket} comment={comment}",
         )
 
     return result.to_dict()
@@ -535,17 +588,6 @@ def close_all_positions_fok(
     comment: str = "",
     magic: int = None,
 ) -> Dict[str, Any]:
-    """
-    Close all positions, optionally filtered by symbol and/or magic.
-
-    Args:
-        symbol:  filter by symbol (None = all symbols)
-        comment: close comment
-        magic:   filter by magic number (None = all)
-
-    Returns:
-        dict with keys: retcode, closed, total, failed, results, total_profit
-    """
     if not _ensure_mt5():
         return {
             "retcode": -1,
@@ -554,16 +596,10 @@ def close_all_positions_fok(
             "_stub": False,
         }
 
-    # Get positions
-    if symbol:
-        positions = mt5.positions_get(symbol=symbol)
-    else:
-        positions = mt5.positions_get()
-
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
     if positions is None:
         positions = []
 
-    # Filter by magic if specified
     if magic is not None:
         positions = [p for p in positions if p.magic == magic]
 
@@ -598,11 +634,28 @@ def close_all_positions_fok(
                 f"  ✅ Closed {pos.symbol} ticket={pos.ticket} "
                 f"profit={result.profit:.2f}"
             )
+            _safe_notify_success(
+                symbol=pos.symbol,
+                action="EXIT",
+                direction=result.side or ("sell" if pos.type == mt5.POSITION_TYPE_BUY else "buy"),
+                price=result.price,
+                lots=pos.volume,
+                reason=comment or "close_all_positions_fok",
+                profit=result.profit,
+                ticket=pos.ticket,
+            )
         else:
             failed += 1
             logger.error(
                 f"  ❌ Failed {pos.symbol} ticket={pos.ticket}: "
                 f"{result.error}"
+            )
+            _safe_notify_error(
+                symbol=pos.symbol,
+                action="CLOSE_ALL",
+                error=result.error or "close failed",
+                retcode=result.retcode,
+                context=f"ticket={pos.ticket} comment={comment}",
             )
 
     success = failed == 0
@@ -618,20 +671,7 @@ def close_all_positions_fok(
     }
 
 
-# ---------------------------------------------------------------------------
-# Position Snapshot & P&L
-# ---------------------------------------------------------------------------
-
 def get_positions_snapshot(symbol: str = None) -> Dict[str, Any]:
-    """
-    Get snapshot of open positions.
-
-    Args:
-        symbol: filter by symbol (None = all)
-
-    Returns:
-        dict with keys: total_profit_usd, positions, count
-    """
     if not _ensure_mt5():
         return {
             "total_profit_usd": 0.0,
@@ -640,11 +680,7 @@ def get_positions_snapshot(symbol: str = None) -> Dict[str, Any]:
             "error": "MT5 not initialized",
         }
 
-    if symbol:
-        positions = mt5.positions_get(symbol=symbol)
-    else:
-        positions = mt5.positions_get()
-
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
     if positions is None:
         positions = []
 
@@ -653,7 +689,6 @@ def get_positions_snapshot(symbol: str = None) -> Dict[str, Any]:
 
     for pos in positions:
         total_profit += pos.profit
-
         pos_list.append({
             "ticket": pos.ticket,
             "symbol": pos.symbol,
@@ -681,50 +716,29 @@ def get_realized_profit_since(
     symbol: str = None,
     since_dt: datetime = None,
 ) -> float:
-    """
-    Get realized profit from closed deals since a datetime.
-
-    Args:
-        symbol:   filter by symbol (None = all)
-        since_dt: start datetime (None = today 00:00 UTC)
-
-    Returns:
-        float: total realized profit in account currency
-    """
     if not _ensure_mt5():
         return 0.0
 
-    # Default to today 00:00 UTC
     if since_dt is None:
         now = datetime.now(timezone.utc)
         since_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Get deals
     from_ts = int(since_dt.timestamp())
-    to_ts = int(datetime.now(timezone.utc).timestamp()) + 3600  # +1hr buffer
+    to_ts = int(datetime.now(timezone.utc).timestamp()) + 3600
 
     deals = mt5.history_deals_get(from_ts, to_ts)
-
     if deals is None:
         return 0.0
 
     total_profit = 0.0
-
     for deal in deals:
-        # Filter by symbol if specified
         if symbol and deal.symbol != symbol:
             continue
-
-        # Only count exit deals (DEAL_ENTRY_OUT)
         if deal.entry == mt5.DEAL_ENTRY_OUT:
             total_profit += deal.profit + deal.swap + deal.commission
 
     return total_profit
 
-
-# ---------------------------------------------------------------------------
-# Simulation using order_calc_profit
-# ---------------------------------------------------------------------------
 
 def calc_profit(
     symbol: str,
@@ -733,21 +747,7 @@ def calc_profit(
     open_price: float,
     close_price: float,
 ) -> float:
-    """
-    Calculate theoretical profit using MT5's order_calc_profit.
-
-    Args:
-        symbol:      e.g. "XAUUSD"
-        side:        "buy" or "sell"
-        lot:         lot size
-        open_price:  entry price
-        close_price: exit price
-
-    Returns:
-        float: profit in account currency (negative = loss)
-    """
     if not _ensure_mt5():
-        # Fallback calculation
         sc = SYMBOLS.get(symbol)
         if sc is None:
             return 0.0
@@ -758,10 +758,8 @@ def calc_profit(
         else:
             pips = (open_price - close_price) / pip_size
 
-        # Rough estimate: $10 per pip per standard lot for gold
         return round(pips * lot * 10.0, 2)
 
-    # Use MT5's built-in calculator
     order_type = mt5.ORDER_TYPE_BUY if side.lower() == "buy" else mt5.ORDER_TYPE_SELL
 
     profit = mt5.order_calc_profit(
@@ -775,7 +773,7 @@ def calc_profit(
     if profit is None:
         logger.warning(
             f"order_calc_profit returned None for {symbol} "
-            f"{side} {lot} @ {open_price} → {close_price}"
+            f"{side} {lot} @ {open_price} -> {close_price}"
         )
         return 0.0
 
@@ -788,18 +786,6 @@ def calc_profit_pips(
     open_price: float,
     close_price: float,
 ) -> float:
-    """
-    Calculate profit in pips.
-
-    Args:
-        symbol:      e.g. "XAUUSD"
-        side:        "buy" or "sell"
-        open_price:  entry price
-        close_price: exit price
-
-    Returns:
-        float: profit in pips (negative = loss)
-    """
     sc = SYMBOLS.get(symbol)
     pip_size = sc.pip_size if sc else 0.01
 
@@ -809,12 +795,7 @@ def calc_profit_pips(
         return (open_price - close_price) / pip_size
 
 
-# ---------------------------------------------------------------------------
-# Simulation Mode (for BACKTEST)
-# ---------------------------------------------------------------------------
-
 class SimulatedPosition:
-    """In-memory simulated position for backtesting."""
     def __init__(
         self,
         ticket: int,
@@ -840,7 +821,6 @@ class SimulatedPosition:
         self.comment = comment
 
     def calc_profit(self, current_price: float) -> float:
-        """Calculate current P&L using MT5 order_calc_profit."""
         return calc_profit(
             self.symbol,
             self.side,
@@ -851,11 +831,6 @@ class SimulatedPosition:
 
 
 class SimulatedTrader:
-    """
-    Simulated trader for BACKTEST mode.
-    Maintains in-memory positions and uses MT5 order_calc_profit for P&L.
-    """
-
     def __init__(self):
         self._positions: Dict[int, SimulatedPosition] = {}
         self._ticket_counter = 90000000
@@ -877,7 +852,6 @@ class SimulatedTrader:
         magic: int = 0,
         comment: str = "",
     ) -> Dict[str, Any]:
-        """Open a simulated position."""
         ticket = self._next_ticket()
 
         pos = SimulatedPosition(
@@ -918,7 +892,6 @@ class SimulatedTrader:
         close_price: float,
         comment: str = "",
     ) -> Dict[str, Any]:
-        """Close a simulated position."""
         if ticket not in self._positions:
             return {
                 "success": False,
@@ -960,7 +933,6 @@ class SimulatedTrader:
         }
 
     def close_all(self, symbol: str, close_price: float) -> Dict[str, Any]:
-        """Close all simulated positions for symbol."""
         to_close = [
             t for t, p in self._positions.items()
             if p.symbol == symbol
@@ -985,7 +957,6 @@ class SimulatedTrader:
         }
 
     def get_positions(self, symbol: str = None) -> List[Dict]:
-        """Get open simulated positions."""
         result = []
         for ticket, pos in self._positions.items():
             if symbol and pos.symbol != symbol:
@@ -1003,7 +974,6 @@ class SimulatedTrader:
         return result
 
     def get_floating_pnl(self, symbol: str, current_price: float) -> float:
-        """Get unrealized P&L for symbol."""
         total = 0.0
         for pos in self._positions.values():
             if pos.symbol == symbol:
@@ -1011,32 +981,19 @@ class SimulatedTrader:
         return total
 
     def get_realized_pnl(self) -> float:
-        """Get total realized P&L."""
         return self._realized_profit
 
     def reset(self):
-        """Reset simulator state."""
         self._positions.clear()
         self._closed_trades.clear()
         self._realized_profit = 0.0
         logger.info("[SIM] Reset complete")
 
 
-# Global simulator instance
 simulator = SimulatedTrader()
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
 def health_check() -> Dict[str, Any]:
-    """
-    MT5 connection health check.
-
-    Returns:
-        dict with connection status and account info
-    """
     if not _ensure_mt5():
         return {
             "connected": False,
@@ -1065,30 +1022,17 @@ def health_check() -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Convenience exports
-# ---------------------------------------------------------------------------
-
 __all__ = [
-    # Order execution
     "place_market_order_fok",
     "close_position_fok",
     "close_all_positions_fok",
-
-    # Position info
     "get_positions_snapshot",
     "get_realized_profit_since",
-
-    # Simulation
     "calc_profit",
     "calc_profit_pips",
     "simulator",
     "SimulatedTrader",
-
-    # Connection
     "shutdown",
     "health_check",
-
-    # Result type
     "TradeResult",
 ]
