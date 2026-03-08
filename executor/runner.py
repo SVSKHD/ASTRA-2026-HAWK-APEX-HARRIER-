@@ -93,10 +93,10 @@ class ExecutorRunner:
 
     def _extract_pkt_fields(self, pkt: Any) -> dict:
         return {
-            "current": self._safe_get(pkt, "current_price", "price", "current"),
+            "current": self._safe_get(pkt, "mid", "current_price", "price", "current"),
             "start": self._safe_get(pkt, "start_price", "start"),
-            "high": self._safe_get(pkt, "high_price", "high"),
-            "low": self._safe_get(pkt, "low_price", "low"),
+            "high": self._safe_get(pkt, "high", "high_price"),
+            "low": self._safe_get(pkt, "low", "low_price"),
             "date_mt5": self._safe_get(pkt, "date_mt5"),
             "tick_epoch": self._packet_epoch(pkt),
             "stale": self._is_packet_stale(pkt),

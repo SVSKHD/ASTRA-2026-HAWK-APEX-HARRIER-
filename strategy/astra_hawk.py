@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from .base import BaseStrategy, StrategyResult, PricePacket, PositionInfo
+from .base import BaseStrategy, StrategyResult, PositionInfo
+from .persistence import PersistenceMixin
+
+if TYPE_CHECKING:
+    from executor.price_reader import PricePacket
+    from config.symbols import SymbolConfig
 
 
 EPS = 1e-9
@@ -148,7 +153,7 @@ class AstraHawkStrategy(BaseStrategy):
     def name(self) -> str:
         return "astra_hawk"
 
-    def init(self, symbol: str, sc) -> None:
+    def init(self, symbol: str, sc: "SymbolConfig", base_dir: str = "data") -> None:
         super().init(symbol, sc)
         self._thr: Optional[_ThrState] = None
         self._date: Optional[str] = None
@@ -168,13 +173,13 @@ class AstraHawkStrategy(BaseStrategy):
         try:
             self._date = data.get("date_mt5")
             thr_d = data.get("thr_state")
-            if thr_d and isinstance(thr_d, dict) and thr_d.get("start_price"):
+            if thr_d and isinstance(thr_d, dict) and thr_d.get("start_price") is not None:
                 self._thr = _ThrState.from_snapshot(thr_d)
         except Exception:
             self._thr = None
             self._date = None
 
-    def on_tick(self, pkt: PricePacket, pos: PositionInfo) -> StrategyResult:
+    def on_tick(self, pkt: "PricePacket", pos: PositionInfo) -> StrategyResult:
         sc = self.sc
 
         if self._thr is None:
