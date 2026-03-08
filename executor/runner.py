@@ -22,6 +22,35 @@ class ExecutorRunner:
         self._last_packet_epoch: Dict[Tuple[str, str], Optional[int]] = {}
         self._last_heartbeat_ts: float = 0.0
 
+    def _calc_move_view(self, symbol: str, pkt: Any) -> tuple[Optional[float], str]:
+        try:
+            current = self._safe_get(pkt, "mid", "current_price", "price", "current")
+            start = self._safe_get(pkt, "start_price", "start")
+            if current is None or start is None:
+                return None, "none"
+
+            current = float(current)
+            start = float(start)
+
+            sc = SYMBOLS.get(symbol)
+            pip_size = float(getattr(sc, "pip_size", 0.0) or 0.0)
+            if pip_size <= 0:
+                return None, "none"
+
+            diff = current - start
+            pips = diff / pip_size
+
+            if diff > 0:
+                direction = "long"
+            elif diff < 0:
+                direction = "short"
+            else:
+                direction = "none"
+
+            return pips, direction
+        except Exception:
+            return None, "none"
+
     def get_state(self, symbol: str, strategy_name: str) -> EngineState:
         key = (symbol, strategy_name)
         if key not in self._states:
@@ -91,15 +120,24 @@ class ExecutorRunner:
                 continue
         return False
 
-    def _extract_pkt_fields(self, pkt: Any) -> dict:
+    def _extract_pkt_fields(self, symbol: str, pkt: Any) -> dict:
+        current = self._safe_get(pkt, "mid", "current_price", "price", "current")
+        start = self._safe_get(pkt, "start_price", "start")
+        high = self._safe_get(pkt, "high", "high_price")
+        low = self._safe_get(pkt, "low", "low_price")
+
+        pip_diff, present_direction = self._calc_move_view(symbol, pkt)
+
         return {
-            "current": self._safe_get(pkt, "mid", "current_price", "price", "current"),
-            "start": self._safe_get(pkt, "start_price", "start"),
-            "high": self._safe_get(pkt, "high", "high_price"),
-            "low": self._safe_get(pkt, "low", "low_price"),
+            "current": current,
+            "start": start,
+            "high": high,
+            "low": low,
             "date_mt5": self._safe_get(pkt, "date_mt5"),
             "tick_epoch": self._packet_epoch(pkt),
             "stale": self._is_packet_stale(pkt),
+            "pip_diff": pip_diff,
+            "present_direction": present_direction,
         }
 
     def _extract_signal_view(self, sig: Any) -> tuple[str, str]:
@@ -127,7 +165,7 @@ class ExecutorRunner:
         return signal_name, signal_reason
 
     def _print_cycle_status(self, symbol: str, strategy_name: str, pkt: Any, sig: Any, result: Any) -> None:
-        p = self._extract_pkt_fields(pkt)
+        p = self._extract_pkt_fields(symbol,pkt)
         signal_name, signal_reason = self._extract_signal_view(sig)
 
         if result is None:
@@ -199,13 +237,15 @@ class ExecutorRunner:
             return None
 
         if self._is_packet_stale(pkt):
-            p = self._extract_pkt_fields(pkt)
+            p = self._extract_pkt_fields(symbol, pkt)
             print(
                 f"{symbol:<8} | {strategy_name:<32} | "
                 f"cur={self._fmt_num(p['current']):>10} | "
                 f"start={self._fmt_num(p['start']):>10} | "
                 f"high={self._fmt_num(p['high']):>10} | "
                 f"low={self._fmt_num(p['low']):>10} | "
+                f"pips={self._fmt_num(p['pip_diff']):>10} | "
+                f"dir={str(p['present_direction']):<6} | "
                 f"stale=True | skipped"
             )
             return None
