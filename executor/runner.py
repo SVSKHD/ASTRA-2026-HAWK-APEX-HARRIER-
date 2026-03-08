@@ -110,7 +110,7 @@ class ExecutorRunner:
             if isinstance(value, bool):
                 return value
 
-        for name in ("age_seconds", "tick_age_seconds", "packet_age_seconds"):
+        for name in ("age_seconds", "tick_age_seconds", "packet_age_seconds", "stale_seconds"):
             value = getattr(pkt, name, None)
             if value is None:
                 continue
@@ -165,7 +165,7 @@ class ExecutorRunner:
         return signal_name, signal_reason
 
     def _print_cycle_status(self, symbol: str, strategy_name: str, pkt: Any, sig: Any, result: Any) -> None:
-        p = self._extract_pkt_fields(symbol,pkt)
+        p = self._extract_pkt_fields(symbol, pkt)
         signal_name, signal_reason = self._extract_signal_view(sig)
 
         if result is None:
@@ -175,6 +175,8 @@ class ExecutorRunner:
                 f"start={self._fmt_num(p['start']):>10} | "
                 f"high={self._fmt_num(p['high']):>10} | "
                 f"low={self._fmt_num(p['low']):>10} | "
+                f"pips={self._fmt_num(p['pip_diff']):>10} | "
+                f"dir={str(p['present_direction']):<6} | "
                 f"stale={str(p['stale']):<5} | "
                 f"signal={signal_name:<12} | "
                 f"reason={signal_reason} | "
@@ -188,9 +190,11 @@ class ExecutorRunner:
             f"start={self._fmt_num(p['start']):>10} | "
             f"high={self._fmt_num(p['high']):>10} | "
             f"low={self._fmt_num(p['low']):>10} | "
+            f"pips={self._fmt_num(p['pip_diff']):>10} | "
+            f"dir={str(p['present_direction']):<6} | "
             f"stale={str(p['stale']):<5} | "
             f"signal={signal_name:<12} | "
-            f"decision={str(getattr(result, 'decision', None)):<10} | "
+            f"decision={str(getattr(result, 'decision', None)):<18} | "
             f"action={str(getattr(result, 'action', None)):<10} | "
             f"did_trade={str(getattr(result, 'did_trade', None)):<5} | "
             f"side={str(getattr(result, 'side', None)):<5} | "
@@ -329,7 +333,7 @@ class ExecutorRunner:
 if __name__ == "__main__":
     # mode = "MONITOR_ONLY" | "ACTIVE"
     # change to ACTIVE only when intentionally live
-    mode="ACTIVE"
+    mode = "ACTIVE"
     print(f"[BOOT] Starting ExecutorRunner | mode={mode}")
     if mode == "ACTIVE":
         print("[BOOT] LIVE TRADING ENABLED")
