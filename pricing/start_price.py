@@ -29,6 +29,7 @@ from notify import (
     notify_start_locked,
     _safe_broadcast,
     CHANNEL_ERRORS,
+    CHANNEL_UPDATES,
 )
 import os
 
@@ -356,13 +357,8 @@ def init_notifiers():
             updates=os.environ.get("DISCORD_WEBHOOK_UPDATES", ""),
             errors=os.environ.get("DISCORD_WEBHOOK_ERRORS", ""),
         )
-        if any([
-            discord_cfg.general,
-            discord_cfg.critical,
-            discord_cfg.alerts,
-            discord_cfg.updates,
-            discord_cfg.errors,
-        ]):
+
+        if any(discord_cfg.webhooks.values()):
             init_discord(discord_cfg)
             print("✅ Discord initialised")
         else:
@@ -379,6 +375,7 @@ def init_notifiers():
             updates=os.environ.get("TELEGRAM_CHAT_UPDATES", ""),
             errors=os.environ.get("TELEGRAM_CHAT_ERRORS", ""),
         )
+
         if telegram_cfg.bot_token:
             init_telegram(telegram_cfg)
             print("✅ Telegram initialised")
@@ -387,12 +384,27 @@ def init_notifiers():
     except Exception as e:
         print(f"⚠️ Telegram init failed: {e}")
 
+def send_start_runner_boot(symbols: list[str]) -> None:
+    try:
+        _safe_broadcast(
+            channel=CHANNEL_UPDATES,
+            message=(
+                "🚀 START PRICE RUNNER INITIALISED\n"
+                f"SYMBOLS: {', '.join(symbols)}\n"
+                f"UTC: {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}"
+            ),
+        )
+        print("✅ Startup notify queued")
+    except Exception as e:
+        print(f"⚠️ Startup notify failed: {e}")
 
 if __name__ == "__main__":
     init_notifiers()
 
     cfg = PriceSettings()
     symbols = get_enabled_symbols()
+
+    send_start_runner_boot(symbols)
 
     print("=== START PRICE RUNNER STARTING ===", symbols)
     for s in symbols:

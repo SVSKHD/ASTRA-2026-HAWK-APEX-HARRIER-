@@ -83,7 +83,19 @@ def notify_rollover(
         f"SERVER: {server_time}\n"
         f"LOCAL: {local_time}"
     )
-    _safe_broadcast(channel=CHANNEL_UPDATES, message=msg)
+
+    _safe_broadcast(
+        channel=CHANNEL_UPDATES,
+        message=msg,
+        discord_method="send_rollover",
+        telegram_method=None,
+        discord_kwargs={
+            "symbol": symbol,
+            "old_date": old_date,
+            "new_date": new_date,
+            "tick_utc": tick_utc,
+        },
+    )
 
 
 def notify_start_locked(
@@ -105,32 +117,67 @@ def notify_start_locked(
         f"LOCAL: {local_time}\n"
         f"SOURCE: {source}"
     )
-    _safe_broadcast(channel=CHANNEL_ALERTS, message=msg)
+
+    _safe_broadcast(
+        channel=CHANNEL_ALERTS,
+        message=msg,
+        discord_method="send_start_locked",
+        telegram_method=None,
+        discord_kwargs={
+            "symbol": symbol,
+            "price": price,
+            "date_mt5": date_mt5,
+            "source": source,
+            "locked_server_time": server_time,
+            "locked_local_time": local_time,
+        },
+    )
 
 
 def notify_price_heartbeat(
     *,
     symbol: str,
     current: float,
+    bid: float,
+    ask: float,
     start: Optional[float],
     high: Optional[float],
     low: Optional[float],
-    stale_seconds: int,
+    stale: bool,
     date_mt5: str,
-    hhmm_mt5: str,
+    server_time: str,
 ) -> None:
-    state = "STALE" if stale_seconds > 0 else "LIVE"
     msg = (
         f"📈 PRICE UPDATE — {symbol}\n"
-        f"MT5: {date_mt5} {hhmm_mt5}\n"
+        f"MT5 DATE: {date_mt5}\n"
+        f"SERVER: {server_time}\n"
         f"CURRENT: {current}\n"
+        f"BID: {bid}\n"
+        f"ASK: {ask}\n"
         f"START: {start}\n"
         f"HIGH: {high}\n"
         f"LOW: {low}\n"
-        f"STATE: {state}\n"
-        f"STALE_SECONDS: {stale_seconds}"
+        f"STALE: {stale}"
     )
-    _safe_broadcast(channel=CHANNEL_UPDATES, message=msg)
+
+    _safe_broadcast(
+        channel=CHANNEL_UPDATES,
+        message=msg,
+        discord_method="send_price_update",
+        telegram_method=None,
+        discord_kwargs={
+            "symbol": symbol,
+            "mid": current,
+            "bid": bid,
+            "ask": ask,
+            "start_price": start,
+            "high": high,
+            "low": low,
+            "stale": stale,
+            "date_mt5": date_mt5,
+            "server_time": server_time,
+        },
+    )
 
 
 __all__ = [

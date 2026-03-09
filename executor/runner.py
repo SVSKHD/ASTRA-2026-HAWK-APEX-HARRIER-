@@ -22,35 +22,6 @@ class ExecutorRunner:
         self._last_packet_epoch: Dict[Tuple[str, str], Optional[int]] = {}
         self._last_heartbeat_ts: float = 0.0
 
-    def _calc_move_view(self, symbol: str, pkt: Any) -> tuple[Optional[float], str]:
-        try:
-            current = self._safe_get(pkt, "mid", "current_price", "price", "current")
-            start = self._safe_get(pkt, "start_price", "start")
-            if current is None or start is None:
-                return None, "none"
-
-            current = float(current)
-            start = float(start)
-
-            sc = SYMBOLS.get(symbol)
-            pip_size = float(getattr(sc, "pip_size", 0.0) or 0.0)
-            if pip_size <= 0:
-                return None, "none"
-
-            diff = current - start
-            pips = diff / pip_size
-
-            if diff > 0:
-                direction = "long"
-            elif diff < 0:
-                direction = "short"
-            else:
-                direction = "none"
-
-            return pips, direction
-        except Exception:
-            return None, "none"
-
     def get_state(self, symbol: str, strategy_name: str) -> EngineState:
         key = (symbol, strategy_name)
         if key not in self._states:
@@ -86,6 +57,35 @@ class ExecutorRunner:
             if value is not None:
                 return value
         return default
+
+    def _calc_move_view(self, symbol: str, pkt: Any) -> tuple[Optional[float], str]:
+        try:
+            current = self._safe_get(pkt, "mid", "current_price", "price", "current")
+            start = self._safe_get(pkt, "start_price", "start")
+            if current is None or start is None:
+                return None, "none"
+
+            current = float(current)
+            start = float(start)
+
+            sc = SYMBOLS.get(symbol)
+            pip_size = float(getattr(sc, "pip_size", 0.0) or 0.0)
+            if pip_size <= 0:
+                return None, "none"
+
+            diff = current - start
+            pips = diff / pip_size
+
+            if diff > 0:
+                direction = "long"
+            elif diff < 0:
+                direction = "short"
+            else:
+                direction = "none"
+
+            return pips, direction
+        except Exception:
+            return None, "none"
 
     def _packet_epoch(self, pkt: Any) -> Optional[int]:
         for name in (
@@ -125,7 +125,6 @@ class ExecutorRunner:
         start = self._safe_get(pkt, "start_price", "start")
         high = self._safe_get(pkt, "high", "high_price")
         low = self._safe_get(pkt, "low", "low_price")
-
         pip_diff, present_direction = self._calc_move_view(symbol, pkt)
 
         return {
@@ -163,6 +162,19 @@ class ExecutorRunner:
             signal_reason = "-"
 
         return signal_name, signal_reason
+
+    def _print_stale_packet(self, symbol: str, strategy_name: str, pkt: Any) -> None:
+        p = self._extract_pkt_fields(symbol, pkt)
+        print(
+            f"{symbol:<8} | {strategy_name:<32} | "
+            f"cur={self._fmt_num(p['current']):>10} | "
+            f"start={self._fmt_num(p['start']):>10} | "
+            f"high={self._fmt_num(p['high']):>10} | "
+            f"low={self._fmt_num(p['low']):>10} | "
+            f"pips={self._fmt_num(p['pip_diff']):>10} | "
+            f"dir={str(p['present_direction']):<6} | "
+            f"stale=True | skipped"
+        )
 
     def _print_cycle_status(self, symbol: str, strategy_name: str, pkt: Any, sig: Any, result: Any) -> None:
         p = self._extract_pkt_fields(symbol, pkt)
@@ -204,6 +216,47 @@ class ExecutorRunner:
             f"block={str(getattr(result, 'block_reason', None))}"
         )
 
+    def _validated_start_price(self, symbol: str, strategy_name: str, pkt: Any) -> Optional[float]:
+        start_price = getattr(pkt, "start_price", None)
+        start_status = getattr(pkt, "start_status", None)
+
+        if start_status != "LOCKED":
+            self._log("info", symbol, strategy_name, f"start not ready: status={start_status}")
+            return None
+
+        if start_price is None:
+            self._log("info", symbol, strategy_name, "start not ready: start_price=None")
+            return None
+
+        try:
+            return float(start_price)
+        except Exception:
+            self._log("warn", symbol, strategy_name, f"invalid start_price={start_price!r}")
+            return None
+
+    def _is_duplicate_packet(self, key: Tuple[str, str], pkt: Any) -> bool:
+        packet_epoch = self._packet_epoch(pkt)
+        if packet_epoch is None:
+            return False
+
+        if self._last_packet_epoch.get(key) == packet_epoch:
+            return True
+
+        self._last_packet_epoch[key] = packet_epoch
+        return False
+
+    def _read_live_packet(self, symbol: str, strategy_name: str):
+        pkt = read_price_packet(symbol)
+        if pkt is None:
+            print(f"{symbol:<8} | {strategy_name:<32} | packet=None")
+            return None
+
+        if self._is_packet_stale(pkt):
+            self._print_stale_packet(symbol, strategy_name, pkt)
+            return None
+
+        return pkt
+
     def _reconcile_engine_with_broker(self, eng: EngineState) -> None:
         if self.mode != "ACTIVE":
             return
@@ -235,23 +288,8 @@ class ExecutorRunner:
         eng.entry_mode = eng.entry_mode or "normal"
 
     def process_symbol_strategy(self, symbol: str, strategy_name: str):
-        pkt = read_price_packet(symbol)
+        pkt = self._read_live_packet(symbol, strategy_name)
         if pkt is None:
-            print(f"{symbol:<8} | {strategy_name:<32} | packet=None")
-            return None
-
-        if self._is_packet_stale(pkt):
-            p = self._extract_pkt_fields(symbol, pkt)
-            print(
-                f"{symbol:<8} | {strategy_name:<32} | "
-                f"cur={self._fmt_num(p['current']):>10} | "
-                f"start={self._fmt_num(p['start']):>10} | "
-                f"high={self._fmt_num(p['high']):>10} | "
-                f"low={self._fmt_num(p['low']):>10} | "
-                f"pips={self._fmt_num(p['pip_diff']):>10} | "
-                f"dir={str(p['present_direction']):<6} | "
-                f"stale=True | skipped"
-            )
             return None
 
         sc = SYMBOLS.get(symbol)
@@ -259,14 +297,16 @@ class ExecutorRunner:
             self._log("warn", symbol, strategy_name, "symbol config not found")
             return None
 
+        start_price = self._validated_start_price(symbol, strategy_name, pkt)
+        if start_price is None:
+            return None
+
         strategy = self.get_strategy(symbol, strategy_name)
         eng = self.get_state(symbol, strategy_name)
         key = (symbol, strategy_name)
 
-        packet_epoch = self._packet_epoch(pkt)
-        if packet_epoch is not None and self._last_packet_epoch.get(key) == packet_epoch:
+        if self._is_duplicate_packet(key, pkt):
             return None
-        self._last_packet_epoch[key] = packet_epoch
 
         self._reconcile_engine_with_broker(eng)
 
@@ -274,7 +314,7 @@ class ExecutorRunner:
             eng.last_date_mt5 = pkt.date_mt5
             eng.reset_daily()
             try:
-                strategy.on_new_day(pkt.start_price)
+                strategy.on_new_day(start_price)
             except Exception as e:
                 self._log("error", symbol, strategy_name, f"on_new_day_failed: {type(e).__name__}: {e}")
                 return None
@@ -338,4 +378,4 @@ if __name__ == "__main__":
     if mode == "ACTIVE":
         print("[BOOT] LIVE TRADING ENABLED")
     runner = ExecutorRunner(mode=mode, poll_seconds=0.3)
-    runner.run_loop()
+    runner.run_loop()   #now see this  and think and let me know if any fixes no assumptions . just be corect . be very very sure .

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from .base import BaseStrategy, StrategyResult, PositionInfo
-from .persistence import PersistenceMixin
 
 if TYPE_CHECKING:
     from executor.price_reader import PricePacket
@@ -15,15 +14,21 @@ EPS = 1e-9
 
 class _ThrState:
     __slots__ = (
-        "symbol", "start_price",
+        "symbol",
+        "start_price",
         "present_direction",
         "candidate_direction",
         "committed_direction",
         "direction_committed_at",
-        "crossed_1x", "crossed_1x_time", "crossed_1x_bias",
-        "late_armed", "late_disabled_for_day",
-        "window_hit_long", "window_hit_short",
-        "missed_jump_long", "missed_jump_short",
+        "crossed_1x",
+        "crossed_1x_time",
+        "crossed_1x_bias",
+        "late_armed",
+        "late_disabled_for_day",
+        "window_hit_long",
+        "window_hit_short",
+        "missed_jump_long",
+        "missed_jump_short",
     )
 
     def __init__(self, symbol: str, start_price: float):
@@ -81,16 +86,13 @@ def _levels(sc, start: float) -> Dict[str, float]:
         "long_first_max": start + t * ex,
         "long_second": start + t * ca,
         "long_second_close": start + t * ca - buf,
-
         "long_late_entry": start + t * late_at_x,
         "long_late_entry_max": start + t * late_exit_max - late_rem,
         "long_late_exit_min": start + t * late_exit_min,
-
         "short_first": start - t * em,
         "short_first_min": start - t * ex,
         "short_second": start - t * ca,
         "short_second_close": start - t * ca + buf,
-
         "short_late_entry": start - t * late_at_x,
         "short_late_entry_min": start - t * late_exit_max + late_rem,
         "short_late_exit_min": start - t * late_exit_min,
@@ -119,10 +121,6 @@ def _zone_id(date_mt5: str, direction: str) -> Optional[int]:
 
 
 def _exit_targets_from_entry(lvl: Dict[str, float], pos: PositionInfo) -> Dict[str, Optional[float]]:
-    """
-    Convert threshold-based intended move into actual-entry-based exit targets.
-    Entry is decided by threshold logic, but exit is anchored to real fill price.
-    """
     if pos.entry_price is None:
         return {
             "normal_long_tp": None,
@@ -205,16 +203,18 @@ class AstraHawkStrategy(BaseStrategy):
         thr_price = float(sc.threshold) * float(sc.pip_size)
         late_tol = float(sc.pip_size) * 3.0
 
+        # Present direction can remain current-vs-start.
         thr.present_direction = (
             "long" if pkt.mid > thr.start_price + EPS
             else "short" if pkt.mid < thr.start_price - EPS
             else "none"
         )
 
-        if x_up_now is not None and x_dn_now is not None:
-            if x_up_now > x_dn_now:
+        # Candidate direction can use extremes/structure awareness.
+        if x_up_ext is not None and x_dn_ext is not None:
+            if x_up_ext > x_dn_ext:
                 thr.candidate_direction = "long"
-            elif x_dn_now > x_up_now:
+            elif x_dn_ext > x_up_ext:
                 thr.candidate_direction = "short"
             else:
                 thr.candidate_direction = "none"
@@ -225,6 +225,7 @@ class AstraHawkStrategy(BaseStrategy):
                 thr.late_disabled_for_day = True
                 thr.late_armed = False
 
+        # High/low are used only for structure and prominent-direction commitment.
         long_touched = probe_up >= lvl["long_first"] - EPS
         short_touched = probe_dn <= lvl["short_first"] + EPS
 
@@ -246,17 +247,19 @@ class AstraHawkStrategy(BaseStrategy):
             thr.crossed_1x_bias = thr.committed_direction
             crossed_1x_now = True
 
+        # Window hit counters remain current-price based.
         if lvl["long_first"] - EPS <= pkt.mid <= lvl["long_first_max"] + EPS:
             thr.window_hit_long += 1
         if lvl["short_first_min"] - EPS <= pkt.mid <= lvl["short_first"] + EPS:
             thr.window_hit_short += 1
 
+        # Live working x must be current-price based.
         if thr.committed_direction == "long":
-            x_now = x_up_ext
+            x_now = x_up_now
         elif thr.committed_direction == "short":
-            x_now = x_dn_ext
+            x_now = x_dn_now
         else:
-            x_now = max(x_up_ext or 0.0, x_dn_ext or 0.0) or None
+            x_now = max(x_up_now or 0.0, x_dn_now or 0.0) or None
 
         zone_id = _zone_id(pkt.date_mt5, thr.committed_direction)
 
@@ -331,15 +334,17 @@ class AstraHawkStrategy(BaseStrategy):
             return _res("WAIT", "blocked_opposite_direction", miss_reason="opposite_direction_blocked")
 
         if not pos.in_trade:
-            if thr.committed_direction == "long" and probe_up >= lvl["long_second_close"] - EPS:
+            # Direct-to-second must use CURRENT price only.
+            if thr.committed_direction == "long" and pkt.mid >= lvl["long_second_close"] - EPS:
                 return _res("SKIP_DIRECT_TO_SECOND", "skip", miss_reason="direct_to_second")
-            if thr.committed_direction == "short" and probe_dn <= lvl["short_second_close"] + EPS:
+            if thr.committed_direction == "short" and pkt.mid <= lvl["short_second_close"] + EPS:
                 return _res("SKIP_DIRECT_TO_SECOND", "skip", miss_reason="direct_to_second")
 
             late_entry_at_x = float(sc.entry_max_multiplier)
             late_exit_min_x = float(sc.close_multiplier) * 1.45
             late_exit_max_x = float(sc.close_multiplier) * 1.5
 
+            # Late-entry logic also uses current-based x_now.
             if thr.late_armed and not thr.late_disabled_for_day and x_now is not None:
                 if x_now >= late_exit_max_x - EPS:
                     thr.late_armed = False
@@ -351,9 +356,12 @@ class AstraHawkStrategy(BaseStrategy):
                             if lo - EPS <= pkt.mid <= hi + EPS:
                                 thr.late_armed = False
                                 return _res(
-                                    "ENTER_LATE_LONG", "entered",
-                                    did_signal=True, side="buy",
-                                    entry_price=pkt.mid, entry_mode="late",
+                                    "ENTER_LATE_LONG",
+                                    "entered",
+                                    did_signal=True,
+                                    side="buy",
+                                    entry_price=pkt.mid,
+                                    entry_mode="late",
                                 )
                             miss = "late_insufficient_room" if pkt.mid > hi + EPS else "late_price_not_reached"
                             return _res("WAIT", "waiting", miss_reason=miss)
@@ -365,9 +373,12 @@ class AstraHawkStrategy(BaseStrategy):
                             if lo - EPS <= pkt.mid <= hi + EPS:
                                 thr.late_armed = False
                                 return _res(
-                                    "ENTER_LATE_SHORT", "entered",
-                                    did_signal=True, side="sell",
-                                    entry_price=pkt.mid, entry_mode="late",
+                                    "ENTER_LATE_SHORT",
+                                    "entered",
+                                    did_signal=True,
+                                    side="sell",
+                                    entry_price=pkt.mid,
+                                    entry_mode="late",
                                 )
                             miss = "late_insufficient_room" if pkt.mid < lo - EPS else "late_price_not_reached"
                             return _res("WAIT", "waiting", miss_reason=miss)
@@ -376,33 +387,40 @@ class AstraHawkStrategy(BaseStrategy):
             ex = float(sc.entry_max_multiplier)
             ca = float(sc.close_multiplier)
 
-            if thr.committed_direction == "long" and x_up_ext is not None:
-                if em - EPS <= x_up_ext <= ex + EPS:
+            # Normal-entry logic must use CURRENT x only.
+            if thr.committed_direction == "long" and x_up_now is not None:
+                if em - EPS <= x_up_now <= ex + EPS:
                     return _res(
-                        "ENTER_FIRST_LONG", "entered",
-                        did_signal=True, side="buy",
-                        entry_price=pkt.mid, entry_mode="normal",
+                        "ENTER_FIRST_LONG",
+                        "entered",
+                        did_signal=True,
+                        side="buy",
+                        entry_price=pkt.mid,
+                        entry_mode="normal",
                     )
-                if ex + EPS < x_up_ext < ca - EPS:
+                if ex + EPS < x_up_now < ca - EPS:
                     thr.late_armed = not thr.late_disabled_for_day
                     return _res("SKIP_JUMP_OVER_ENTRY", "skip", miss_reason="jumped_over_entry_window")
-                if x_up_ext >= ca - EPS:
-                    thr.late_armed = not thr.late_disabled_for_day and x_up_ext < late_exit_max_x - EPS
+                if x_up_now >= ca - EPS:
+                    thr.late_armed = not thr.late_disabled_for_day and x_up_now < late_exit_max_x - EPS
                     return _res("SKIP_DIRECT_TO_SECOND", "skip", miss_reason="direct_to_second")
                 return _res("WAIT", "waiting", miss_reason="not_in_entry_window")
 
-            if thr.committed_direction == "short" and x_dn_ext is not None:
-                if em - EPS <= x_dn_ext <= ex + EPS:
+            if thr.committed_direction == "short" and x_dn_now is not None:
+                if em - EPS <= x_dn_now <= ex + EPS:
                     return _res(
-                        "ENTER_FIRST_SHORT", "entered",
-                        did_signal=True, side="sell",
-                        entry_price=pkt.mid, entry_mode="normal",
+                        "ENTER_FIRST_SHORT",
+                        "entered",
+                        did_signal=True,
+                        side="sell",
+                        entry_price=pkt.mid,
+                        entry_mode="normal",
                     )
-                if ex + EPS < x_dn_ext < ca - EPS:
+                if ex + EPS < x_dn_now < ca - EPS:
                     thr.late_armed = not thr.late_disabled_for_day
                     return _res("SKIP_JUMP_OVER_ENTRY", "skip", miss_reason="jumped_over_entry_window")
-                if x_dn_ext >= ca - EPS:
-                    thr.late_armed = not thr.late_disabled_for_day and x_dn_ext < late_exit_max_x - EPS
+                if x_dn_now >= ca - EPS:
+                    thr.late_armed = not thr.late_disabled_for_day and x_dn_now < late_exit_max_x - EPS
                     return _res("SKIP_DIRECT_TO_SECOND", "skip", miss_reason="direct_to_second")
                 return _res("WAIT", "waiting", miss_reason="not_in_entry_window")
 
@@ -411,19 +429,23 @@ class AstraHawkStrategy(BaseStrategy):
         if pos.side == "buy":
             if pos.entry_mode == "late":
                 tp = exit_targets["late_long_tp"]
-                if tp is not None and probe_up >= tp - EPS:
+                if tp is not None and pkt.mid >= tp - EPS:
                     return _res(
-                        "EXIT_LATE_LONG", "exited",
-                        did_signal=True, side="buy",
+                        "EXIT_LATE_LONG",
+                        "exited",
+                        did_signal=True,
+                        side="buy",
                         entry_price=pos.entry_price,
                         exit_price=pkt.mid,
                     )
             else:
                 tp = exit_targets["normal_long_tp"]
-                if tp is not None and probe_up >= tp - EPS:
+                if tp is not None and pkt.mid >= tp - EPS:
                     return _res(
-                        "EXIT_SECOND_LONG", "exited",
-                        did_signal=True, side="buy",
+                        "EXIT_SECOND_LONG",
+                        "exited",
+                        did_signal=True,
+                        side="buy",
                         entry_price=pos.entry_price,
                         exit_price=pkt.mid,
                     )
@@ -431,19 +453,23 @@ class AstraHawkStrategy(BaseStrategy):
         elif pos.side == "sell":
             if pos.entry_mode == "late":
                 tp = exit_targets["late_short_tp"]
-                if tp is not None and probe_dn <= tp + EPS:
+                if tp is not None and pkt.mid <= tp + EPS:
                     return _res(
-                        "EXIT_LATE_SHORT", "exited",
-                        did_signal=True, side="sell",
+                        "EXIT_LATE_SHORT",
+                        "exited",
+                        did_signal=True,
+                        side="sell",
                         entry_price=pos.entry_price,
                         exit_price=pkt.mid,
                     )
             else:
                 tp = exit_targets["normal_short_tp"]
-                if tp is not None and probe_dn <= tp + EPS:
+                if tp is not None and pkt.mid <= tp + EPS:
                     return _res(
-                        "EXIT_SECOND_SHORT", "exited",
-                        did_signal=True, side="sell",
+                        "EXIT_SECOND_SHORT",
+                        "exited",
+                        did_signal=True,
+                        side="sell",
                         entry_price=pos.entry_price,
                         exit_price=pkt.mid,
                     )
